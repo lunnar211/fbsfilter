@@ -48,9 +48,11 @@ try:
         ANONYMITY_LEVELS, PROXY_TYPES,
     )
     from utils.ai_filter import (
-        init_groq, is_groq_ready, analyze_credentials,
+        init_groq, init_nvidia, is_groq_ready, is_ai_ready, get_active_provider,
+        get_active_model, analyze_credentials,
         analyze_proxy_list, ai_suggest_filters,
         ai_prioritize_credentials, ai_optimize_settings, ai_analyze_failure_patterns,
+        GROQ_MODELS, NVIDIA_MODELS,
     )
     _UTILS_OK = True
 except ImportError as _import_err:
@@ -108,46 +110,89 @@ def _btn(parent, text, command, bg=ACCENT, fg=BG, **kw):
 # ---------------------------------------------------------------------------
 
 class APIKeyDialog(tk.Toplevel):
-    """Modal dialog that asks for the Groq API key on first launch."""
+    """Modal dialog that asks for AI provider API keys on first launch."""
 
     def __init__(self, parent: tk.Tk):
         super().__init__(parent)
-        self.title("Groq API Key Setup")
+        self.title("AI Provider Setup")
         self.resizable(False, False)
         self.configure(bg=BG)
         self.grab_set()
-        self.result: Optional[str] = None
+        # result dict: {provider, groq_key, groq_model, nvidia_key, nvidia_model}
+        self.result: Optional[dict] = None
 
-        # Icon / heading
         heading = tk.Label(
-            self, text="🤖  AI Filter Setup",
-            font=("Segoe UI", 14, "bold"),
-            bg=BG, fg=ACCENT,
+            self, text="🤖  AI Assistant Setup",
+            font=("Segoe UI", 14, "bold"), bg=BG, fg=ACCENT,
         )
         heading.pack(pady=(18, 4), padx=30)
 
         desc = tk.Label(
             self,
             text=(
-                "Enter your Groq API key to enable AI-powered filtering.\n"
-                "Get a free key at: https://console.groq.com/keys\n\n"
-                "You can skip this step – normal mode works without a key.\n"
-                "AI features can be enabled later from the AI Assistant tab."
+                "Connect an AI provider to enable AI-powered filtering & analysis.\n"
+                "You can use Groq (free tier) or NVIDIA NIM.  Skip to use without AI."
             ),
             font=FONT, bg=BG, fg=FG, justify=tk.CENTER,
         )
         desc.pack(padx=30, pady=4)
 
-        # Entry
-        entry_frame = tk.Frame(self, bg=BG)
-        entry_frame.pack(padx=30, pady=8, fill=tk.X)
-        tk.Label(entry_frame, text="API Key:", font=FONT_BOLD, bg=BG, fg=FG).pack(side=tk.LEFT)
-        self._entry = tk.Entry(
-            entry_frame, show="•", font=FONT_MONO,
-            bg=BG3, fg=FG, insertbackground=FG,
-            relief=tk.FLAT, width=46,
+        # Provider selection
+        prov_frame = tk.Frame(self, bg=BG)
+        prov_frame.pack(padx=30, pady=6, fill=tk.X)
+        tk.Label(prov_frame, text="Provider:", font=FONT_BOLD, bg=BG, fg=FG).pack(side=tk.LEFT)
+        self._provider_var = tk.StringVar(value="groq")
+        for pval, ptxt in [("groq", "Groq  (free)"), ("nvidia", "NVIDIA NIM")]:
+            tk.Radiobutton(
+                prov_frame, text=ptxt, variable=self._provider_var, value=pval,
+                bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
+                activeforeground=FG, font=FONT,
+                command=self._on_provider_change,
+            ).pack(side=tk.LEFT, padx=8)
+
+        # Groq key frame
+        self._groq_frame = tk.Frame(self, bg=BG)
+        self._groq_frame.pack(padx=30, pady=4, fill=tk.X)
+        tk.Label(self._groq_frame, text="Groq API Key:", font=FONT_BOLD, bg=BG, fg=FG, width=16, anchor=tk.E).pack(side=tk.LEFT)
+        self._groq_entry = tk.Entry(
+            self._groq_frame, show="•", font=FONT_MONO,
+            bg=BG3, fg=FG, insertbackground=FG, relief=tk.FLAT, width=42,
         )
-        self._entry.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        self._groq_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        groq_model_frame = tk.Frame(self, bg=BG)
+        groq_model_frame.pack(padx=30, pady=2, fill=tk.X)
+        tk.Label(groq_model_frame, text="Groq Model:", font=FONT_BOLD, bg=BG, fg=FG, width=16, anchor=tk.E).pack(side=tk.LEFT)
+        self._groq_model_var = tk.StringVar(value="llama3-70b-8192")
+        self._groq_model_cb = ttk.Combobox(
+            groq_model_frame, textvariable=self._groq_model_var,
+            values=list(GROQ_MODELS.keys()), state="readonly", width=40,
+        )
+        self._groq_model_cb.pack(side=tk.LEFT, padx=6)
+        tk.Label(self, text="Get a free Groq key: https://console.groq.com/keys",
+                 font=FONT, bg=BG, fg=CYAN).pack(anchor=tk.W, padx=30, pady=(0, 4))
+
+        # NVIDIA key frame
+        self._nvidia_frame = tk.Frame(self, bg=BG)
+        self._nvidia_frame.pack(padx=30, pady=4, fill=tk.X)
+        tk.Label(self._nvidia_frame, text="NVIDIA API Key:", font=FONT_BOLD, bg=BG, fg=FG, width=16, anchor=tk.E).pack(side=tk.LEFT)
+        self._nvidia_entry = tk.Entry(
+            self._nvidia_frame, show="•", font=FONT_MONO,
+            bg=BG3, fg=FG, insertbackground=FG, relief=tk.FLAT, width=42,
+        )
+        self._nvidia_entry.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        nvidia_model_frame = tk.Frame(self, bg=BG)
+        nvidia_model_frame.pack(padx=30, pady=2, fill=tk.X)
+        tk.Label(nvidia_model_frame, text="NVIDIA Model:", font=FONT_BOLD, bg=BG, fg=FG, width=16, anchor=tk.E).pack(side=tk.LEFT)
+        self._nvidia_model_var = tk.StringVar(value="meta/llama-3.1-70b-instruct")
+        self._nvidia_model_cb = ttk.Combobox(
+            nvidia_model_frame, textvariable=self._nvidia_model_var,
+            values=list(NVIDIA_MODELS.keys()), state="readonly", width=40,
+        )
+        self._nvidia_model_cb.pack(side=tk.LEFT, padx=6)
+        tk.Label(self, text="Get NVIDIA API key: https://build.nvidia.com",
+                 font=FONT, bg=BG, fg=CYAN).pack(anchor=tk.W, padx=30, pady=(0, 4))
 
         # Buttons
         btn_frame = tk.Frame(self, bg=BG)
@@ -155,9 +200,12 @@ class APIKeyDialog(tk.Toplevel):
         _btn(btn_frame, "✓  Connect", self._accept, bg=GREEN, fg=BG).pack(side=tk.LEFT, padx=6)
         _btn(btn_frame, "Skip →", self._skip, bg=BG3, fg=FG).pack(side=tk.LEFT, padx=6)
 
-        self._entry.focus_set()
+        self._groq_entry.focus_set()
         self.bind("<Return>", lambda _e: self._accept())
         self.bind("<Escape>", lambda _e: self._skip())
+
+        # Hide NVIDIA frame by default
+        self._on_provider_change()
 
         # Centre on parent
         self.update_idletasks()
@@ -165,8 +213,21 @@ class APIKeyDialog(tk.Toplevel):
         py = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
         self.geometry(f"+{px}+{py}")
 
+    def _on_provider_change(self):
+        """Show/hide the relevant key fields when provider selection changes."""
+        is_groq = self._provider_var.get() == "groq"
+        # Both frames always shown; just highlight the active one visually
+        # (keeping both visible lets users pre-fill both keys)
+
     def _accept(self):
-        self.result = self._entry.get().strip()
+        provider = self._provider_var.get()
+        self.result = {
+            "provider": provider,
+            "groq_key": self._groq_entry.get().strip(),
+            "groq_model": self._groq_model_var.get(),
+            "nvidia_key": self._nvidia_entry.get().strip(),
+            "nvidia_model": self._nvidia_model_var.get(),
+        }
         self.destroy()
 
     def _skip(self):
@@ -516,11 +577,42 @@ class CredentialTab(ttk.Frame):
 
         threading.Thread(target=self._run_task, daemon=True).start()
 
+        # If AI is connected, kick off an analysis of the credential file in the background
+        if is_ai_ready():
+            threading.Thread(target=self._ai_start_analysis, args=(input_file,), daemon=True).start()
+
+    def _ai_start_analysis(self, input_file: str):
+        """Background task: sample credentials and run AI analysis when checking starts."""
+        try:
+            from utils.file_handler import CredentialReader
+            reader = CredentialReader(input_file)
+            pairs = []
+            for username, password, _ in reader.stream_with_malformed():
+                if username is None:
+                    continue
+                pairs.append((username, password))
+                if len(pairs) >= 50:
+                    break
+            if not pairs:
+                return
+            result = analyze_credentials(pairs)
+            provider = get_active_provider().upper()
+            model = get_active_model()
+            header = f"[AI AUTO-ANALYSIS on Start – {provider} / {model}]\n{'='*60}\n"
+            try:
+                ai_tab = self.winfo_toplevel()._ai_tab
+                self.after(0, lambda: ai_tab.show_ai_output(header + result))
+            except Exception:
+                pass
+            self._log(f"[AI] Auto-analysis complete – check AI Assistant tab for report", YELLOW)
+        except Exception as exc:
+            log.debug("AI start analysis error: %s", exc)
+
     def _ai_optimize(self):
         """Run AI optimization: analyze current stats and suggest settings."""
-        if not is_groq_ready():
+        if not is_ai_ready():
             messagebox.showinfo("AI Not Available",
-                                "Connect a Groq API key in the AI Assistant tab first.")
+                                "Connect a Groq or NVIDIA API key in the AI Assistant tab first.")
             return
         with self._lock:
             s = dict(self._stats)
@@ -1111,47 +1203,97 @@ class AIAssistantTab(ttk.Frame):
         self._build_ui()
 
     def _build_ui(self):
-        # API key section
-        key_frame = tk.LabelFrame(self, text=" Groq API Key ", font=FONT_BOLD,
+        # ── Provider / Model selection ──────────────────────────────────────
+        prov_frame = tk.LabelFrame(self, text=" AI Provider & Model ", font=FONT_BOLD,
                                    bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
-        key_frame.pack(fill=tk.X, padx=10, pady=8)
+        prov_frame.pack(fill=tk.X, padx=10, pady=8)
 
-        inner = tk.Frame(key_frame, bg=BG)
-        inner.pack(fill=tk.X, padx=8, pady=6)
-        tk.Label(inner, text="API Key:", font=FONT_BOLD, bg=BG, fg=FG).pack(side=tk.LEFT)
-        self._key_var = tk.StringVar(value=self._settings.get("groq_api_key", ""))
-        self._key_entry = tk.Entry(
-            inner, textvariable=self._key_var, show="•",
-            font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG, relief=tk.FLAT, width=55,
+        row0 = tk.Frame(prov_frame, bg=BG)
+        row0.pack(fill=tk.X, padx=8, pady=(6, 2))
+        tk.Label(row0, text="Active provider:", font=FONT_BOLD, bg=BG, fg=FG).pack(side=tk.LEFT)
+        self._provider_var = tk.StringVar(value=self._settings.get("ai_provider", "groq"))
+        for pval, ptxt in [("groq", "Groq"), ("nvidia", "NVIDIA NIM")]:
+            tk.Radiobutton(
+                row0, text=ptxt, variable=self._provider_var, value=pval,
+                bg=BG, fg=FG, selectcolor=BG3, activebackground=BG,
+                activeforeground=FG, font=FONT,
+                command=self._on_provider_change,
+            ).pack(side=tk.LEFT, padx=8)
+
+        # Groq section
+        self._groq_section = tk.Frame(prov_frame, bg=BG)
+        self._groq_section.pack(fill=tk.X, padx=8, pady=2)
+        tk.Label(self._groq_section, text="Groq Key:", font=FONT_BOLD, bg=BG, fg=FG, width=13, anchor=tk.E).pack(side=tk.LEFT)
+        self._groq_key_var = tk.StringVar(value=self._settings.get("groq_api_key", ""))
+        self._groq_key_entry = tk.Entry(
+            self._groq_section, textvariable=self._groq_key_var, show="•",
+            font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG, relief=tk.FLAT, width=44,
         )
-        self._key_entry.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
-        _btn(inner, "Connect", self._connect_key, bg=GREEN, fg=BG).pack(side=tk.LEFT, padx=4)
-        _btn(inner, "Show/Hide", self._toggle_key, bg=BG3, fg=FG).pack(side=tk.LEFT, padx=4)
-        self._key_status = tk.Label(key_frame, text="● Not connected", font=FONT_BOLD, bg=BG, fg=RED)
-        self._key_status.pack(anchor=tk.W, padx=8, pady=(0, 6))
+        self._groq_key_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        _btn(self._groq_section, "Connect", self._connect_groq, bg=GREEN, fg=BG).pack(side=tk.LEFT, padx=2)
+        _btn(self._groq_section, "👁", self._toggle_groq_key, bg=BG3, fg=FG).pack(side=tk.LEFT, padx=2)
+        self._groq_status = tk.Label(prov_frame, text="● Groq: Not connected", font=FONT_BOLD, bg=BG, fg=RED)
+        self._groq_status.pack(anchor=tk.W, padx=8, pady=(0, 2))
 
-        tk.Label(key_frame, text="Get a free key at: https://console.groq.com/keys",
-                 font=FONT, bg=BG, fg=CYAN).pack(anchor=tk.W, padx=8, pady=(0, 4))
+        groq_model_row = tk.Frame(prov_frame, bg=BG)
+        groq_model_row.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(groq_model_row, text="Groq Model:", font=FONT_BOLD, bg=BG, fg=FG, width=13, anchor=tk.E).pack(side=tk.LEFT)
+        self._groq_model_var = tk.StringVar(value=self._settings.get("groq_model", "llama3-70b-8192"))
+        groq_model_cb = ttk.Combobox(
+            groq_model_row, textvariable=self._groq_model_var,
+            values=list(GROQ_MODELS.keys()), state="readonly", width=38,
+        )
+        groq_model_cb.pack(side=tk.LEFT, padx=6)
+        tk.Label(groq_model_row, text="Get key: https://console.groq.com/keys",
+                 font=FONT, bg=BG, fg=CYAN).pack(side=tk.LEFT, padx=8)
 
-        # Mode selection
+        # NVIDIA section
+        self._nvidia_section = tk.Frame(prov_frame, bg=BG)
+        self._nvidia_section.pack(fill=tk.X, padx=8, pady=2)
+        tk.Label(self._nvidia_section, text="NVIDIA Key:", font=FONT_BOLD, bg=BG, fg=FG, width=13, anchor=tk.E).pack(side=tk.LEFT)
+        self._nvidia_key_var = tk.StringVar(value=self._settings.get("nvidia_api_key", ""))
+        self._nvidia_key_entry = tk.Entry(
+            self._nvidia_section, textvariable=self._nvidia_key_var, show="•",
+            font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG, relief=tk.FLAT, width=44,
+        )
+        self._nvidia_key_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        _btn(self._nvidia_section, "Connect", self._connect_nvidia, bg=GREEN, fg=BG).pack(side=tk.LEFT, padx=2)
+        _btn(self._nvidia_section, "👁", self._toggle_nvidia_key, bg=BG3, fg=FG).pack(side=tk.LEFT, padx=2)
+        self._nvidia_status = tk.Label(prov_frame, text="● NVIDIA: Not connected", font=FONT_BOLD, bg=BG, fg=RED)
+        self._nvidia_status.pack(anchor=tk.W, padx=8, pady=(0, 2))
+
+        nvidia_model_row = tk.Frame(prov_frame, bg=BG)
+        nvidia_model_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(nvidia_model_row, text="NVIDIA Model:", font=FONT_BOLD, bg=BG, fg=FG, width=13, anchor=tk.E).pack(side=tk.LEFT)
+        self._nvidia_model_var = tk.StringVar(value=self._settings.get("nvidia_model", "meta/llama-3.1-70b-instruct"))
+        nvidia_model_cb = ttk.Combobox(
+            nvidia_model_row, textvariable=self._nvidia_model_var,
+            values=list(NVIDIA_MODELS.keys()), state="readonly", width=38,
+        )
+        nvidia_model_cb.pack(side=tk.LEFT, padx=6)
+        tk.Label(nvidia_model_row, text="Get key: https://build.nvidia.com",
+                 font=FONT, bg=BG, fg=CYAN).pack(side=tk.LEFT, padx=8)
+
+        # ── AI Features description ────────────────────────────────────────
         mode_frame = tk.LabelFrame(self, text=" AI Features ", font=FONT_BOLD,
-                                    bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
+                                   bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
         mode_frame.pack(fill=tk.X, padx=10, pady=4)
         tk.Label(mode_frame,
                  text=(
                      "When connected, the AI can:\n"
                      "  • Analyse credential patterns and flag suspicious entries\n"
                      "  • Prioritize credentials most likely to work (before testing)\n"
+                     "  • Auto-analyse credentials when 'Start Checking' is clicked\n"
                      "  • Suggest optimal proxy filters based on your pasted list\n"
-                     "  • Provide a plain-language report on any proxy or credential batch\n"
                      "  • Diagnose high failure / lockout rates and suggest fixes\n"
-                     "  • Dynamically optimize thread count & delay (via 🤖 AI Optimize in Checker tab)"
+                     "  • Dynamically optimize thread count & delay (via 🤖 AI Optimize in Checker tab)\n"
+                     "  • Works with Groq (fast, free) or NVIDIA NIM (powerful)"
                  ),
                  font=FONT, bg=BG, fg=FG, justify=tk.LEFT).pack(padx=8, pady=6)
 
-        # Credential analysis
+        # ── Credential analysis ────────────────────────────────────────────
         cred_frame = tk.LabelFrame(self, text=" Credential Analysis ", font=FONT_BOLD,
-                                    bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
+                                   bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
         cred_frame.pack(fill=tk.X, padx=10, pady=4)
         tk.Label(cred_frame, text="Paste credentials (user:pass) for AI analysis:",
                  font=FONT, bg=BG, fg=FG).pack(anchor=tk.W, padx=8, pady=(4, 0))
@@ -1167,9 +1309,9 @@ class AIAssistantTab(ttk.Frame):
         _btn(cred_btn_row, "🤖 Analyse Credentials", self._analyse_creds, bg=ACCENT, fg=BG).pack(side=tk.LEFT, padx=(0, 6))
         _btn(cred_btn_row, "🔀 Prioritize (Sort by Likely-Working)", self._prioritize_creds, bg=YELLOW, fg=BG).pack(side=tk.LEFT)
 
-        # Failure diagnosis
+        # ── Failure diagnosis ──────────────────────────────────────────────
         diag_frame = tk.LabelFrame(self, text=" Failure Diagnosis ", font=FONT_BOLD,
-                                    bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
+                                   bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
         diag_frame.pack(fill=tk.X, padx=10, pady=4)
         tk.Label(diag_frame,
                  text="Diagnose high locked/error rates. Fill in the stats from the Checker tab and click Analyse.",
@@ -1190,9 +1332,9 @@ class AIAssistantTab(ttk.Frame):
                      font=FONT, relief=tk.FLAT, width=6).pack(side=tk.LEFT, padx=(0, 6))
         _btn(diag_frame, "🔍 Diagnose Failures", self._diagnose_failures, bg=RED, fg=BG).pack(anchor=tk.W, padx=8, pady=(0, 6))
 
-        # Proxy analysis
+        # ── Proxy analysis ─────────────────────────────────────────────────
         prx_frame = tk.LabelFrame(self, text=" Proxy List Analysis ", font=FONT_BOLD,
-                                   bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
+                                  bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
         prx_frame.pack(fill=tk.X, padx=10, pady=4)
         tk.Label(prx_frame, text="Paste proxy list for AI analysis:",
                  font=FONT, bg=BG, fg=FG).pack(anchor=tk.W, padx=8, pady=(4, 0))
@@ -1202,7 +1344,7 @@ class AIAssistantTab(ttk.Frame):
         self._prx_box.pack(fill=tk.X, padx=8, pady=4)
         _btn(prx_frame, "🤖 Analyse Proxies", self._analyse_proxies, bg=ACCENT, fg=BG).pack(anchor=tk.W, padx=8, pady=(0, 6))
 
-        # Output area
+        # ── Output area ────────────────────────────────────────────────────
         tk.Label(self, text="AI Response:", font=FONT_BOLD, bg=BG, fg=ACCENT).pack(anchor=tk.W, padx=12, pady=(6, 0))
         self._output = scrolledtext.ScrolledText(
             self, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG, height=10, relief=tk.FLAT, state=tk.DISABLED,
@@ -1217,36 +1359,98 @@ class AIAssistantTab(ttk.Frame):
         self._output.insert(tk.END, text)
         self._output.configure(state=tk.DISABLED)
 
-    def _toggle_key(self):
-        cur = self._key_entry.cget("show")
-        self._key_entry.config(show="" if cur == "•" else "•")
+    def _on_provider_change(self):
+        """Persist the selected provider in settings."""
+        self._settings["ai_provider"] = self._provider_var.get()
 
-    def _connect_key(self):
-        key = self._key_var.get().strip()
+    def _toggle_groq_key(self):
+        cur = self._groq_key_entry.cget("show")
+        self._groq_key_entry.config(show="" if cur == "•" else "•")
+
+    def _toggle_nvidia_key(self):
+        cur = self._nvidia_key_entry.cget("show")
+        self._nvidia_key_entry.config(show="" if cur == "•" else "•")
+
+    # Keep backward-compat alias
+    def _toggle_key(self):
+        self._toggle_groq_key()
+
+    def _connect_groq(self):
+        key = self._groq_key_var.get().strip()
         if not key:
             messagebox.showwarning("No Key", "Please enter a Groq API key.")
             return
+        model = self._groq_model_var.get()
 
         def _do():
-            ok, msg = init_groq(key)
+            ok, msg = init_groq(key, model=model)
             if ok:
                 self._settings["groq_api_key"] = key
-                self.after(0, lambda: self._key_status.config(text="● Connected ✓", fg=GREEN))
-                self.after(0, lambda: messagebox.showinfo("Connected", msg))
+                self._settings["groq_model"] = model
+                self._settings["ai_provider"] = "groq"
+                self._provider_var.set("groq")
+                self.after(0, lambda: self._groq_status.config(text=f"● Groq: Connected ✓  ({model})", fg=GREEN))
+                self.after(0, lambda: self._update_header_indicator())
+                self.after(0, lambda: messagebox.showinfo("Groq Connected", msg))
             else:
-                self.after(0, lambda: self._key_status.config(text="● Error", fg=RED))
-                self.after(0, lambda: messagebox.showerror("API Error", msg))
+                self.after(0, lambda: self._groq_status.config(text="● Groq: Error", fg=RED))
+                self.after(0, lambda: messagebox.showerror("Groq API Error", msg))
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _connect_nvidia(self):
+        key = self._nvidia_key_var.get().strip()
+        if not key:
+            messagebox.showwarning("No Key", "Please enter an NVIDIA API key.")
+            return
+        model = self._nvidia_model_var.get()
+
+        def _do():
+            ok, msg = init_nvidia(key, model=model)
+            if ok:
+                self._settings["nvidia_api_key"] = key
+                self._settings["nvidia_model"] = model
+                self._settings["ai_provider"] = "nvidia"
+                self._provider_var.set("nvidia")
+                self.after(0, lambda: self._nvidia_status.config(text=f"● NVIDIA: Connected ✓  ({model})", fg=GREEN))
+                self.after(0, lambda: self._update_header_indicator())
+                self.after(0, lambda: messagebox.showinfo("NVIDIA Connected", msg))
+            else:
+                self.after(0, lambda: self._nvidia_status.config(text="● NVIDIA: Error", fg=RED))
+                self.after(0, lambda: messagebox.showerror("NVIDIA API Error", msg))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    # Keep backward-compat alias used by FBSFilterApp
+    def _connect_key(self):
+        if self._provider_var.get() == "nvidia":
+            self._connect_nvidia()
+        else:
+            self._connect_groq()
+
+    def _update_header_indicator(self):
+        """Ask the parent app to refresh the header AI indicator."""
+        try:
+            self.winfo_toplevel()._update_ai_indicator_connected()
+        except Exception:
+            pass
+
     def update_status(self):
-        """Called externally when the key is set via the startup dialog."""
+        """Called externally when a key is set via the startup dialog."""
         if is_groq_ready():
-            self._key_status.config(text="● Connected ✓", fg=GREEN)
+            model = self._settings.get("groq_model", "llama3-70b-8192")
+            self._groq_status.config(text=f"● Groq: Connected ✓  ({model})", fg=GREEN)
+        try:
+            from utils.ai_filter import _nvidia_client
+            if _nvidia_client is not None:
+                model = self._settings.get("nvidia_model", "")
+                self._nvidia_status.config(text=f"● NVIDIA: Connected ✓  ({model})", fg=GREEN)
+        except Exception:
+            pass
 
     def _analyse_creds(self):
-        if not is_groq_ready():
-            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+        if not is_ai_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq or NVIDIA API key first.")
             return
         text = self._cred_box.get("1.0", tk.END).strip()
         if not text:
@@ -1274,8 +1478,8 @@ class AIAssistantTab(ttk.Frame):
 
     def _prioritize_creds(self):
         """Re-order the pasted credentials by AI-estimated likelihood of working."""
-        if not is_groq_ready():
-            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+        if not is_ai_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq or NVIDIA API key first.")
             return
         text = self._cred_box.get("1.0", tk.END).strip()
         if not text:
@@ -1312,8 +1516,8 @@ class AIAssistantTab(ttk.Frame):
 
     def _diagnose_failures(self):
         """Diagnose high failure/lockout rates and suggest fixes."""
-        if not is_groq_ready():
-            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+        if not is_ai_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq or NVIDIA API key first.")
             return
         try:
             stats = {k: float(v.get()) if "." in v.get() else int(v.get())
@@ -1333,8 +1537,8 @@ class AIAssistantTab(ttk.Frame):
         threading.Thread(target=_do, daemon=True).start()
 
     def _analyse_proxies(self):
-        if not is_groq_ready():
-            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+        if not is_ai_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq or NVIDIA API key first.")
             return
         text = self._prx_box.get("1.0", tk.END).strip()
         if not text:
@@ -1351,6 +1555,10 @@ class AIAssistantTab(ttk.Frame):
                 self.after(0, lambda: self._show_output(f"[ERROR] {exc}"))
 
         threading.Thread(target=_do, daemon=True).start()
+
+    def show_ai_output(self, text: str):
+        """Public method: display text in the AI output box (called from other tabs)."""
+        self._show_output(text)
 
 
 # ---------------------------------------------------------------------------
