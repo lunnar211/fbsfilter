@@ -1,9 +1,22 @@
 # fbsfilter
 
-**fbsfilter** is a credential-filter tool for Windows (and Linux/macOS).  
-It loads a list of leaked credentials (`username:password`), checks which accounts are still active by attempting a login to a configurable target, and writes sorted results to separate output files.
+**FBSFilter** is an advanced GUI credential-filter and proxy-management tool for Windows.  
+It ships as a ready-to-run **`FBSFilter.exe`** – no Python installation required.
 
 > ⚠️ **Legal Notice** – This tool is intended solely for security research, penetration testing, and account recovery on systems you own or have explicit written permission to test. Unauthorised credential stuffing or account access is illegal in most jurisdictions. The authors assume no liability for misuse.
+
+---
+
+## ⬇️ Download the Windows EXE
+
+**Pre-built binaries are automatically produced by GitHub Actions.**
+
+| How to get the EXE | Steps |
+|---|---|
+| **Latest release** | Go to the [Releases](../../releases) page → download `FBSFilter-Windows.zip` → extract → run `FBSFilter.exe` |
+| **From a CI build** | Go to [Actions](../../actions) → click the most recent *Build Windows EXE* run → scroll to **Artifacts** → download `FBSFilter-Windows-EXE` |
+
+> No Python, no pip, no dependencies to install – just unzip and double-click `FBSFilter.exe`.
 
 ---
 
@@ -11,15 +24,57 @@ It loads a list of leaked credentials (`username:password`), checks which accoun
 
 | Feature | Details |
 |---|---|
-| **Load leaked data** | Streams large files (millions of lines) without loading everything into RAM |
-| **Configurable target** | Login URL, field names, and success criteria via `config.ini` |
+| **GUI application** | Dark-themed desktop app – runs without a terminal |
+| **Credential Checker** | Multi-threaded login testing; configurable target URL, threads, timeout |
+| **Proxy Filter** | Paste any proxy list (proxydb.net, raw dumps, etc.), auto-detect format, filter by type / anonymity / country, live-test all proxies concurrently |
+| **AI Assistant** | Groq-powered credential pattern analysis and proxy analysis (requires free API key) |
+| **Settings** | Persist target URL, login field names, threading parameters across sessions |
 | **Result categories** | `working.txt`, `invalid.txt`, `locked.txt`, `2fa.txt` |
-| **Multi-threading** | Configurable number of worker threads for high throughput |
-| **Proxy support** | HTTP / HTTPS / SOCKS5 with automatic rotation and bad-proxy removal |
-| **No-proxy mode** | Direct connection with a single flag |
-| **Progress bar** | Live stats via `tqdm` (processed, working, invalid, locked, 2FA, errors) |
-| **Checkpoint / resume** | Saves progress periodically; resumes automatically if interrupted |
-| **Logging** | All events timestamped to `fbsfilter.log` |
+| **Proxy rotation** | HTTP / HTTPS / SOCKS4 / SOCKS5 with automatic bad-proxy removal |
+| **Checkpoint / resume** | Saves progress; resumes if interrupted |
+
+---
+
+## First Launch
+
+1. **Run `FBSFilter.exe`**
+2. A dialog will ask for a **Groq API key** (for the AI features)
+   - Get a free key at <https://console.groq.com/keys>
+   - Click **Skip** to use normal mode – all non-AI features work without a key
+
+---
+
+## GUI Tabs
+
+### 🔑 Credential Checker
+- Browse for a credential file (`user:pass` per line) and an optional proxy file
+- Configure threads, timeout, delimiter
+- Hit **▶ Start Checking** – live progress bar and colour-coded stats update in real time
+- Results are written to `working.txt`, `invalid.txt`, `locked.txt`, `2fa.txt`
+
+### 🌐 Proxy Filter
+- Paste any proxy list – supports every format:
+  - `1.2.3.4:8080`
+  - `http://1.2.3.4:8080`
+  - Tab-separated table rows from proxydb.net, proxyscrape.com, etc.
+- Filter by **protocol** (HTTP / HTTPS / SOCKS4 / SOCKS5)
+- Filter by **anonymity level** (Transparent / Anonymous / Elite)
+- Filter by **country code**
+- **Live proxy testing** – concurrent test with configurable timeout and worker count
+- Save the filtered list in URL, `host:port`, or CSV format
+- **→ Use as Proxy File** sets the filtered list directly in the Credential Checker tab
+- **✨ AI Suggest Filters** uses Groq to auto-suggest the best filter settings (requires API key)
+
+### 🤖 AI Assistant
+- Connect a Groq API key at any time
+- **Credential Analysis** – identifies patterns in your credential list (weak passwords, disposable emails, test accounts)
+- **Proxy Analysis** – summarises your proxy list and suggests optimal filters
+- Passwords are **never sent raw** to the AI – only username, password length, and character-class patterns are transmitted
+
+### ⚙️ Settings
+- Target URL, username/password form fields, success/failure keywords
+- Thread count, timeout, retry count, request delay, credential delimiter
+- All settings are saved automatically
 
 ---
 
@@ -27,43 +82,49 @@ It loads a list of leaked credentials (`username:password`), checks which accoun
 
 ```
 fbsfilter/
-├── fbsfilter.py          # Main entry point
-├── config.ini            # Configuration (target URL, threads, proxy settings …)
+├── fbsfilter_gui.py      # GUI application (main entry point)
+├── fbsfilter.py          # Legacy CLI entry point
+├── fbsfilter.spec        # PyInstaller build spec
+├── build_exe.py          # Local build helper script
+├── config.ini            # Default configuration
 ├── requirements.txt      # Python dependencies
-├── utils/
-│   ├── __init__.py
-│   ├── checker.py        # HTTP login attempt + result classification
-│   ├── file_handler.py   # Streaming file I/O + result writers
-│   └── proxy_manager.py  # Proxy pool with rotation
-└── README.md
+├── .github/
+│   └── workflows/
+│       └── build_exe.yml # CI: builds FBSFilter.exe on Windows automatically
+└── utils/
+    ├── __init__.py
+    ├── ai_filter.py      # Groq AI integration
+    ├── checker.py        # HTTP login attempt + result classification
+    ├── file_handler.py   # Streaming file I/O + result writers
+    ├── proxy_filter.py   # Advanced proxy parsing, filtering, testing
+    └── proxy_manager.py  # Proxy pool with rotation (used by CLI)
 ```
 
 ---
 
-## Quick Start
+## Building the EXE Locally (Windows)
 
-### 1. Install dependencies
+If you want to build the EXE yourself:
 
-```bash
+```powershell
+# 1. Install Python 3.11+ from python.org
+# 2. Install dependencies
 pip install -r requirements.txt
+
+# 3. Build using the helper script
+python build_exe.py
+# or directly:
+pyinstaller fbsfilter.spec --noconfirm --clean
 ```
 
-### 2. Prepare input files
+The output will be in `dist\FBSFilter\FBSFilter.exe`.  
+Zip the entire `dist\FBSFilter\` folder for distribution.
 
-**`leaks.txt`** – one credential per line:
-```
-user@example.com:hunter2
-john.doe@mail.com:P@ssw0rd
-```
+---
 
-**`proxies.txt`** *(optional)* – one proxy per line:
-```
-socks5://user:pass@1.2.3.4:1080
-http://5.6.7.8:8080
-https://9.10.11.12:3128
-```
+## CLI Usage (fbsfilter.py)
 
-### 3. Run
+The original command-line tool still works:
 
 ```bash
 # No proxy, 20 threads
@@ -71,104 +132,7 @@ python fbsfilter.py -i leaks.txt -t 20
 
 # With proxy file, 50 threads
 python fbsfilter.py -i leaks.txt -p proxies.txt -t 50
-
-# Custom config for another site
-python fbsfilter.py -c my_config.ini -i emails.txt
-
-# Force no-proxy even if config enables proxies
-python fbsfilter.py -i leaks.txt --no-proxy
-
-# Skip first 5000 lines (manual resume)
-python fbsfilter.py -i leaks.txt --skip 5000
 ```
-
----
-
-## Configuration (`config.ini`)
-
-```ini
-[Target]
-url                      = https://www.facebook.com/login.php
-username_field           = email
-password_field           = pass
-extra_fields             = {"login": "1", "next": ""}
-method                   = POST
-success_redirect_contains = facebook.com
-failure_keyword          = incorrect password
-
-[General]
-threads         = 10
-timeout         = 10
-retries         = 2
-delay           = 0.5
-delimiter       = :
-checkpoint_every = 500
-
-[Proxy]
-enabled      = false
-proxy_file   = proxies.txt
-rotate_every = 1
-test_proxies = false
-
-[Output]
-working_file = working.txt
-invalid_file = invalid.txt
-locked_file  = locked.txt
-twofa_file   = 2fa.txt
-log_file     = fbsfilter.log
-```
-
-### Adapting for another site
-
-1. Change `url` to the login endpoint.
-2. Change `username_field` / `password_field` to match the HTML form field names.
-3. Set `success_redirect_contains` to a URL fragment that only appears after a successful login.
-4. Set `failure_keyword` to text that appears on the login page when the password is wrong.
-5. Add any extra hidden form fields under `extra_fields` as a JSON object.
-
----
-
-## Command-Line Reference
-
-```
-usage: fbsfilter [-h] -i FILE [-c FILE] [-p FILE] [-t N] [-d CHAR]
-                 [--no-proxy] [--url URL] [--skip N] [-v]
-
-  -i, --input FILE     Input credentials file (required)
-  -c, --config FILE    Path to config.ini  (default: config.ini)
-  -p, --proxies FILE   Proxy list file     (enables proxy mode)
-  -t, --threads N      Worker thread count (overrides config)
-  -d, --delimiter CHAR Credential delimiter (overrides config)
-  --no-proxy           Disable proxies unconditionally
-  --url URL            Override login URL from config
-  --skip N             Skip the first N credentials
-  -v, --verbose        Enable debug logging to console
-```
-
----
-
-## Output Files
-
-| File | Contents |
-|---|---|
-| `working.txt` | Credentials where login succeeded |
-| `invalid.txt` | Wrong password or account not found |
-| `locked.txt` | Account / IP blocked, CAPTCHA triggered |
-| `2fa.txt` | Valid credentials but 2-factor auth required |
-| `fbsfilter.log` | Full timestamped log |
-
-Each line is in `username:password  # detail` format.
-
----
-
-## Building a Standalone Windows `.exe`
-
-```bash
-pip install pyinstaller
-pyinstaller --onefile --name fbsfilter fbsfilter.py
-```
-
-The executable will be in `dist/fbsfilter.exe`.
 
 ---
 
@@ -177,8 +141,10 @@ The executable will be in `dist/fbsfilter.exe`.
 | Package | Purpose |
 |---|---|
 | `requests` | HTTP requests |
-| `requests[socks]` | SOCKS5 proxy support |
+| `requests[socks]` | SOCKS4/5 proxy support |
+| `groq` | Groq AI API client |
 | `colorama` | Coloured console output on Windows |
 | `tqdm` | Progress bars |
 | `urllib3` | SSL warning suppression |
+| `pyinstaller` | Builds the standalone `.exe` |
 
