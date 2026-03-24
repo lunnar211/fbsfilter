@@ -399,7 +399,7 @@ class CredentialTab(ttk.Frame):
         self._log(
             f"\n[DONE] {s['processed']} processed in {elapsed:.1f}s  "
             f"| Working: {s['working']}  Invalid: {s['invalid']}  "
-            f"Locked: {s['locked']}  2FA: {s['twofa']}  Errors: {s['errors']}",
+            f"Locked: {s['locked']}  2FA: {s['2fa']}  Errors: {s['errors']}",
             GREEN,
         )
 

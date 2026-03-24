@@ -53,12 +53,14 @@ class ResultWriter:
         invalid_file: str = "invalid.txt",
         locked_file: str = "locked.txt",
         twofa_file: str = "2fa.txt",
+        error_file: str = "error.txt",
     ):
         self.files = {
             "working": working_file,
             "invalid": invalid_file,
             "locked": locked_file,
             "2fa": twofa_file,
+            "error": error_file,
         }
         self._lock = threading.Lock()
         self._handles: dict = {}

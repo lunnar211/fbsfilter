@@ -327,6 +327,7 @@ def main() -> None:
         invalid_file=out.get("invalid_file", "invalid.txt"),
         locked_file=out.get("locked_file", "locked.txt"),
         twofa_file=out.get("twofa_file", "2fa.txt"),
+        error_file=out.get("error_file", "error.txt"),
     )
 
     # -- Checkpoint / resume -------------------------------------------------
