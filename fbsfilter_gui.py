@@ -82,6 +82,10 @@ FONT = ("Segoe UI", 10)
 FONT_BOLD = ("Segoe UI", 10, "bold")
 FONT_MONO = ("Consolas", 9)
 
+# Timeout (seconds) used for non-blocking queue puts in the feeder thread.
+# Small enough to respond to stop requests quickly without busy-looping.
+_QUEUE_PUT_TIMEOUT = 0.2
+
 # ---------------------------------------------------------------------------
 # Helper – styled button
 # ---------------------------------------------------------------------------
@@ -203,28 +207,41 @@ class CredentialTab(ttk.Frame):
                  font=FONT_MONO, relief=tk.FLAT, width=55).grid(row=1, column=1, sticky=tk.EW, **pad)
         _btn(ctrl, "Browse", self._browse_proxy).grid(row=1, column=2, padx=4)
 
+        # Country filter row
+        tk.Label(ctrl, text="Country Filter (opt.):", font=FONT_BOLD, bg=BG2, fg=FG).grid(row=2, column=0, sticky=tk.W, **pad)
+        country_inner = tk.Frame(ctrl, bg=BG2)
+        country_inner.grid(row=2, column=1, columnspan=2, sticky=tk.EW, **pad)
+        self._country_filter_var = tk.StringVar()
+        tk.Entry(country_inner, textvariable=self._country_filter_var, bg=BG3, fg=FG,
+                 insertbackground=FG, font=FONT_MONO, relief=tk.FLAT, width=20).pack(side=tk.LEFT)
+        tk.Label(country_inner,
+                 text="Comma-separated ISO codes, e.g. US,GB,SG  (filters proxy list by country — FBS is global, main hubs: SG, AU, EU)",
+                 font=FONT, bg=BG2, fg=CYAN, wraplength=460, justify=tk.LEFT).pack(side=tk.LEFT, padx=8)
+
         # Threads / Timeout / Delimiter in a row
-        row2 = tk.Frame(ctrl, bg=BG2)
-        row2.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=10, pady=4)
+        row3 = tk.Frame(ctrl, bg=BG2)
+        row3.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=10, pady=4)
         _ctrl_fields = [("Threads:", "_thr_var", "threads", "10", 5),
                         ("Timeout(s):", "_to_var", "timeout", "10", 5),
                         ("Delimiter:", "_delim_var", "delimiter", ":", 4)]
         for lbl, attr, key, default, w in _ctrl_fields:
-            tk.Label(row2, text=lbl, font=FONT_BOLD, bg=BG2, fg=FG).pack(side=tk.LEFT, padx=(0, 2))
+            tk.Label(row3, text=lbl, font=FONT_BOLD, bg=BG2, fg=FG).pack(side=tk.LEFT, padx=(0, 2))
             var = tk.StringVar(value=str(self._settings.get(key, default)))
             setattr(self, attr, var)
-            tk.Entry(row2, textvariable=var, bg=BG3, fg=FG, insertbackground=FG,
+            tk.Entry(row3, textvariable=var, bg=BG3, fg=FG, insertbackground=FG,
                      font=FONT, relief=tk.FLAT, width=w).pack(side=tk.LEFT, padx=(0, 12))
 
         ctrl.columnconfigure(1, weight=1)
 
-        # Run / Stop buttons
+        # Run / Stop / Reset buttons
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(pady=4)
         self._run_btn = _btn(btn_row, "▶  Start Checking", self._start, bg=GREEN, fg=BG)
         self._run_btn.pack(side=tk.LEFT, padx=8)
         self._stop_btn = _btn(btn_row, "■  Stop", self._stop, bg=RED, fg=BG, state=tk.DISABLED)
         self._stop_btn.pack(side=tk.LEFT, padx=8)
+        self._reset_btn = _btn(btn_row, "🔄  Reset", self._reset, bg=BG3, fg=FG)
+        self._reset_btn.pack(side=tk.LEFT, padx=8)
 
         # Progress bar
         self._progress = ttk.Progressbar(self, mode="determinate", length=600)
@@ -243,13 +260,69 @@ class CredentialTab(ttk.Frame):
             lbl.pack(side=tk.LEFT, padx=10)
             self._stat_vars[key] = lbl
 
-        # Log area
-        tk.Label(self, text="Live Log", font=FONT_BOLD, bg=BG, fg=ACCENT).pack(anchor=tk.W, padx=12)
+        # Main content: log (left) + live response viewer (right) in a paned window
+        pane = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG, sashwidth=6,
+                              sashrelief=tk.RAISED, relief=tk.FLAT)
+        pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # Left: Live Log
+        log_frame = tk.Frame(pane, bg=BG)
+        tk.Label(log_frame, text="Live Log", font=FONT_BOLD, bg=BG, fg=ACCENT).pack(anchor=tk.W)
         self._log_area = scrolledtext.ScrolledText(
-            self, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG,
-            state=tk.DISABLED, height=14, relief=tk.FLAT,
+            log_frame, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG,
+            state=tk.DISABLED, relief=tk.FLAT,
         )
-        self._log_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self._log_area.pack(fill=tk.BOTH, expand=True)
+        pane.add(log_frame, minsize=300, stretch="always")
+
+        # Right: Live Response Viewer
+        resp_frame = tk.Frame(pane, bg=BG2)
+        tk.Label(resp_frame, text="🔍  Live Response Viewer", font=FONT_BOLD, bg=BG2, fg=ACCENT).pack(anchor=tk.W, padx=6, pady=(4, 0))
+
+        # Quick single-credential test section
+        qtest_frame = tk.LabelFrame(resp_frame, text=" Quick Single Test ", font=FONT_BOLD,
+                                     bg=BG2, fg=CYAN, labelanchor=tk.NW, bd=1, relief=tk.GROOVE)
+        qtest_frame.pack(fill=tk.X, padx=6, pady=4)
+
+        qt_row1 = tk.Frame(qtest_frame, bg=BG2)
+        qt_row1.pack(fill=tk.X, padx=4, pady=2)
+        tk.Label(qt_row1, text="User:", font=FONT_BOLD, bg=BG2, fg=FG, width=6, anchor=tk.E).pack(side=tk.LEFT)
+        self._qt_user_var = tk.StringVar()
+        tk.Entry(qt_row1, textvariable=self._qt_user_var, bg=BG3, fg=FG,
+                 insertbackground=FG, font=FONT_MONO, relief=tk.FLAT, width=22).pack(side=tk.LEFT, padx=2)
+
+        qt_row2 = tk.Frame(qtest_frame, bg=BG2)
+        qt_row2.pack(fill=tk.X, padx=4, pady=2)
+        tk.Label(qt_row2, text="Pass:", font=FONT_BOLD, bg=BG2, fg=FG, width=6, anchor=tk.E).pack(side=tk.LEFT)
+        self._qt_pass_var = tk.StringVar()
+        tk.Entry(qt_row2, textvariable=self._qt_pass_var, show="•", bg=BG3, fg=FG,
+                 insertbackground=FG, font=FONT_MONO, relief=tk.FLAT, width=22).pack(side=tk.LEFT, padx=2)
+
+        _btn(qtest_frame, "▶ Test Now", self._quick_test, bg=ACCENT, fg=BG).pack(pady=(2, 4))
+
+        # Last result detail panel
+        detail_frame = tk.LabelFrame(resp_frame, text=" Last Result Details ", font=FONT_BOLD,
+                                      bg=BG2, fg=CYAN, labelanchor=tk.NW, bd=1, relief=tk.GROOVE)
+        detail_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
+
+        for attr, label in [("_rv_status", "Status:"), ("_rv_user", "User:"),
+                              ("_rv_url", "Final URL:"), ("_rv_detail", "Detail:")]:
+            row = tk.Frame(detail_frame, bg=BG2)
+            row.pack(fill=tk.X, padx=4, pady=1)
+            tk.Label(row, text=label, font=FONT_BOLD, bg=BG2, fg=FG, width=10, anchor=tk.E).pack(side=tk.LEFT)
+            lbl = tk.Label(row, text="–", font=FONT_MONO, bg=BG2, fg=CYAN,
+                           anchor=tk.W, wraplength=240, justify=tk.LEFT)
+            lbl.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
+            setattr(self, attr, lbl)
+
+        tk.Label(detail_frame, text="Response Snippet:", font=FONT_BOLD, bg=BG2, fg=FG).pack(anchor=tk.W, padx=4, pady=(4, 0))
+        self._rv_body = scrolledtext.ScrolledText(
+            detail_frame, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG,
+            state=tk.DISABLED, relief=tk.FLAT, height=8,
+        )
+        self._rv_body.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+
+        pane.add(resp_frame, minsize=260, stretch="never")
 
     # -- Callbacks ----------------------------------------------------------
 
@@ -282,6 +355,26 @@ class CredentialTab(ttk.Frame):
                 lbl.config(text=f"{display}: {s.get(key, 0)}")
         self.after(0, _do)
 
+    def _update_response_viewer(self, result):
+        """Update the right-side live response panel with the latest result."""
+        colour_map = {
+            "working": GREEN, "invalid": RED, "locked": YELLOW,
+            "2fa": CYAN, "error": RED,
+        }
+        status_val = result.status.value
+        colour = colour_map.get(status_val, FG)
+
+        def _do():
+            self._rv_status.config(text=status_val.upper(), fg=colour)
+            self._rv_user.config(text=f"{result.username}:{result.password}")
+            self._rv_url.config(text=result.response_url or "–")
+            self._rv_detail.config(text=result.detail or "–")
+            self._rv_body.configure(state=tk.NORMAL)
+            self._rv_body.delete("1.0", tk.END)
+            self._rv_body.insert(tk.END, result.response_body or "(no body captured)")
+            self._rv_body.configure(state=tk.DISABLED)
+        self.after(0, _do)
+
     def _start(self):
         if self._running:
             return
@@ -295,13 +388,73 @@ class CredentialTab(ttk.Frame):
         self._stats = {"processed": 0, "working": 0, "invalid": 0, "locked": 0, "2fa": 0, "errors": 0}
         self._run_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.NORMAL)
+        self._reset_btn.config(state=tk.DISABLED)
         self._progress["value"] = 0
 
         threading.Thread(target=self._run_task, daemon=True).start()
 
     def _stop(self):
         self._stop_event.set()
-        self._log("[INFO] Stop requested…", YELLOW)
+        self._log("[INFO] Stop requested – draining workers…", YELLOW)
+
+    def _reset(self):
+        """Reset the checker to its initial state (clears log, stats, progress)."""
+        if self._running:
+            messagebox.showwarning("Running", "Please stop the checker before resetting.")
+            return
+        self._stop_event.clear()
+        self._stats = {"processed": 0, "working": 0, "invalid": 0, "locked": 0, "2fa": 0, "errors": 0}
+        for key, lbl in self._stat_vars.items():
+            display = "2FA" if key == "2fa" else key.upper()
+            lbl.config(text=f"{display}: 0")
+        self._progress["value"] = 0
+        self._progress_lbl.config(text="")
+        self._log_area.configure(state=tk.NORMAL)
+        self._log_area.delete("1.0", tk.END)
+        self._log_area.configure(state=tk.DISABLED)
+        self._rv_status.config(text="–", fg=CYAN)
+        self._rv_user.config(text="–")
+        self._rv_url.config(text="–")
+        self._rv_detail.config(text="–")
+        self._rv_body.configure(state=tk.NORMAL)
+        self._rv_body.delete("1.0", tk.END)
+        self._rv_body.configure(state=tk.DISABLED)
+        self._run_btn.config(state=tk.NORMAL)
+        self._stop_btn.config(state=tk.DISABLED)
+        self._reset_btn.config(state=tk.NORMAL)
+
+    def _quick_test(self):
+        """Test a single credential manually and show the result in the response viewer."""
+        username = self._qt_user_var.get().strip()
+        password = self._qt_pass_var.get().strip()
+        if not username or not password:
+            messagebox.showwarning("Quick Test", "Enter both username and password to test.")
+            return
+        url = self._settings.get("target_url", "https://www.facebook.com/login.php")
+        try:
+            timeout = int(self._to_var.get())
+        except ValueError:
+            timeout = 10
+
+        proxy_file = self._proxy_var.get().strip() or None
+        proxy_manager: Optional[ProxyManager] = None
+        if proxy_file and os.path.isfile(proxy_file):
+            proxy_manager = ProxyManager(proxy_file=proxy_file)
+
+        def _do():
+            proxies = proxy_manager.get() if proxy_manager else None
+            checker = CredentialChecker(target=TargetConfig(url=url), timeout=timeout, proxies=proxies)
+            result = checker.check(username, password)
+            self._update_response_viewer(result)
+            colour_map = {
+                "working": GREEN, "invalid": FG, "locked": YELLOW, "2fa": CYAN, "error": RED,
+            }
+            self._log(
+                f"[QUICK TEST][{result.status.value.upper():8s}] {username}:{password}  – {result.detail}",
+                colour_map.get(result.status.value, FG),
+            )
+
+        threading.Thread(target=_do, daemon=True).start()
 
     def _run_task(self):
         try:
@@ -313,6 +466,7 @@ class CredentialTab(ttk.Frame):
             self._running = False
             self.after(0, lambda: self._run_btn.config(state=tk.NORMAL))
             self.after(0, lambda: self._stop_btn.config(state=tk.DISABLED))
+            self.after(0, lambda: self._reset_btn.config(state=tk.NORMAL))
 
     def _run_task_inner(self):
         input_file = self._input_var.get().strip()
@@ -335,8 +489,36 @@ class CredentialTab(ttk.Frame):
 
         proxy_manager: Optional[ProxyManager] = None
         if proxy_file and os.path.isfile(proxy_file):
+            # Apply optional country filter to the proxy list
+            cc_raw = self._country_filter_var.get().strip()
+            cc_filter = [x.strip().upper() for x in cc_raw.split(",") if x.strip()] if cc_raw else []
+            if cc_filter:
+                try:
+                    from utils.proxy_filter import parse_proxy_text, filter_entries, save_proxy_list
+                    import tempfile
+                    with open(proxy_file, "r", encoding="utf-8", errors="replace") as _fh:
+                        raw_proxy_text = _fh.read()
+                    all_proxies = parse_proxy_text(raw_proxy_text)
+                    filtered_proxies = filter_entries(all_proxies, country_codes=cc_filter)
+                    if filtered_proxies:
+                        tmp_proxy = os.path.join(tempfile.gettempdir(), "fbsfilter_cc_filtered.txt")
+                        save_proxy_list(filtered_proxies, tmp_proxy, fmt="url")
+                        proxy_file = tmp_proxy
+                        self._log(
+                            f"[PROXY] Country filter {cc_filter}: {len(filtered_proxies)}/{len(all_proxies)} proxies kept",
+                            YELLOW,
+                        )
+                    else:
+                        self._log(f"[PROXY] Country filter {cc_filter} matched 0 proxies – using full list", RED)
+                except Exception as _e:
+                    self._log(f"[PROXY] Country filter error: {_e} – using full list", RED)
+
             proxy_manager = ProxyManager(proxy_file=proxy_file)
-            self._log(f"[PROXY] {proxy_manager.count} proxies loaded", CYAN)
+            if proxy_manager.count == 0:
+                self._log("[PROXY] No valid proxies found – running without proxy", RED)
+                proxy_manager = None
+            else:
+                self._log(f"[PROXY] {proxy_manager.count} proxies loaded", CYAN)
 
         task_queue: queue.Queue = queue.Queue(maxsize=threads * 4)
         start_time = time.time()
@@ -347,9 +529,10 @@ class CredentialTab(ttk.Frame):
                 if item is None:
                     task_queue.task_done()
                     break
+                # When stop is requested: drain without processing so task_queue.join() completes
                 if self._stop_event.is_set():
                     task_queue.task_done()
-                    break
+                    continue
                 username, password = item
                 proxies = proxy_manager.get() if proxy_manager else None
                 checker = CredentialChecker(target=target, timeout=timeout, proxies=proxies)
@@ -363,6 +546,7 @@ class CredentialTab(ttk.Frame):
                     self._stats[stat_key] += 1
 
                 self._update_stats()
+                self._update_response_viewer(result)
                 colour_map = {
                     "working": GREEN, "invalid": FG, "locked": YELLOW,
                     "2fa": CYAN, "error": RED,
@@ -383,8 +567,17 @@ class CredentialTab(ttk.Frame):
         for _username, _password in reader.stream():
             if self._stop_event.is_set():
                 break
-            task_queue.put((_username, _password))
+            # Non-blocking put with stop-check to avoid hanging the feeder thread
+            while True:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    task_queue.put((_username, _password), timeout=_QUEUE_PUT_TIMEOUT)
+                    break
+                except queue.Full:
+                    continue
 
+        # Send sentinel values; workers drain and exit cleanly
         for _ in workers:
             task_queue.put(None)
 
