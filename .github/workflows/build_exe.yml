@@ -1,0 +1,118 @@
+name: Build Windows EXE
+
+on:
+  # Build on every push to the main/master branch
+  push:
+    branches:
+      - main
+      - master
+      - copilot/add-groq-api-integration
+    # Also trigger on version tags (e.g. v1.0.0) for automatic releases
+    tags:
+      - "v*"
+
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      # ──────────────────────────────────────────────────────────────────
+      # 1. Check out the repository
+      # ──────────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────────────
+      # 2. Set up Python (Windows, 64-bit)
+      # ──────────────────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 3. Cache pip packages to speed up repeated builds
+      # ──────────────────────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ──────────────────────────────────────────────────────────────────
+      # 4. Install all Python dependencies
+      # ──────────────────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ──────────────────────────────────────────────────────────────────
+      # 5. Build the single-file Windows EXE using PyInstaller
+      # ──────────────────────────────────────────────────────────────────
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller fbsfilter.spec --noconfirm --clean
+
+      # ──────────────────────────────────────────────────────────────────
+      # 6. Verify the EXE was created
+      # ──────────────────────────────────────────────────────────────────
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path dist -Recurse -Filter "FBSFilter.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "FBSFilter.exe not found in dist/"
+            exit 1
+          }
+          Write-Output "Built: $($exe.FullName)  ($([math]::Round($exe.Length / 1MB, 2)) MB)"
+
+      # ──────────────────────────────────────────────────────────────────
+      # 7. Upload the EXE as a workflow artifact
+      #    (downloadable from the Actions tab for every build)
+      # ──────────────────────────────────────────────────────────────────
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FBSFilter-Windows-EXE
+          # Upload the entire dist/FBSFilter folder (contains the exe + dlls)
+          path: dist\FBSFilter\
+          if-no-files-found: error
+          retention-days: 90
+
+      # ──────────────────────────────────────────────────────────────────
+      # 8. Create a GitHub Release when a version tag is pushed
+      #    (e.g. git tag v1.0.0 && git push origin v1.0.0)
+      # ──────────────────────────────────────────────────────────────────
+      - name: Zip release archive
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\FBSFilter\* -DestinationPath dist\FBSFilter-Windows.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist\FBSFilter-Windows.zip
+          generate_release_notes: true
+          body: |
+            ## FBSFilter – Windows EXE
+
+            ### How to run
+            1. Download and extract **FBSFilter-Windows.zip**
+            2. Run **FBSFilter.exe** (no Python required)
+            3. On first launch you will be asked for a Groq API key
+               (get one free at https://console.groq.com/keys) – or click **Skip** to use normal mode
+
+            ### What's included
+            - 🔑 **Credential Checker** – multi-threaded login testing with proxy support
+            - 🌐 **Proxy Filter** – paste any proxy list (proxydb.net, etc.), filter, test, save
+            - 🤖 **AI Assistant** – Groq-powered credential/proxy analysis (requires API key)
+            - ⚙️ **Settings** – configure target URL, threads, timeout and more
