@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# PyInstaller
+*.spec
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Logs and output
+logs/
+*.log
+working.txt
+invalid.txt
+locked.txt
+2fa.txt
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
