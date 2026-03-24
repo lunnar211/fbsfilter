@@ -39,6 +39,7 @@ class CheckResult:
     status: Status
     detail: str = ""
     response_url: str = ""
+    response_body: str = ""
 
 
 @dataclass
@@ -52,6 +53,9 @@ class TargetConfig:
     failure_keyword: str = "incorrect password"
     success_status: Optional[int] = None
 
+
+# Maximum number of characters captured from a response body for the live viewer.
+_MAX_RESPONSE_BODY = 2000
 
 # Keywords that indicate a CAPTCHA / rate-limit / lockout response
 _LOCK_KEYWORDS = [
@@ -171,8 +175,9 @@ class CredentialChecker:
 
         final_url = resp.url.lower()
         body = resp.text.lower()
+        raw_body = resp.text[:_MAX_RESPONSE_BODY]
 
-        return self._classify(username, password, resp.status_code, final_url, body)
+        return self._classify(username, password, resp.status_code, final_url, body, raw_body)
 
     def _classify(
         self,
@@ -181,6 +186,7 @@ class CredentialChecker:
         status_code: int,
         final_url: str,
         body: str,
+        raw_body: str = "",
     ) -> CheckResult:
 
         # Locked / CAPTCHA check (highest priority)
@@ -192,6 +198,7 @@ class CredentialChecker:
                     status=Status.LOCKED,
                     detail="captcha/lock detected",
                     response_url=final_url,
+                    response_body=raw_body,
                 )
 
         # 2FA check
@@ -203,6 +210,7 @@ class CredentialChecker:
                     status=Status.TWOFA,
                     detail="2FA required",
                     response_url=final_url,
+                    response_body=raw_body,
                 )
 
         # Specific status code check
@@ -213,6 +221,7 @@ class CredentialChecker:
                 status=Status.INVALID,
                 detail=f"status {status_code}",
                 response_url=final_url,
+                response_body=raw_body,
             )
 
         # Failure keyword check
@@ -223,6 +232,7 @@ class CredentialChecker:
                 status=Status.INVALID,
                 detail="failure keyword matched",
                 response_url=final_url,
+                response_body=raw_body,
             )
 
         # Success URL check
@@ -236,6 +246,7 @@ class CredentialChecker:
                     status=Status.WORKING,
                     detail="redirect matched",
                     response_url=final_url,
+                    response_body=raw_body,
                 )
 
         # Fallback – treat as invalid if we ended up back at the login page
@@ -246,6 +257,7 @@ class CredentialChecker:
                 status=Status.INVALID,
                 detail="redirected back to login",
                 response_url=final_url,
+                response_body=raw_body,
             )
 
         # Default: mark as invalid to avoid false positives
@@ -255,4 +267,5 @@ class CredentialChecker:
             status=Status.INVALID,
             detail=f"unrecognised response (status={status_code})",
             response_url=final_url,
+            response_body=raw_body,
         )
