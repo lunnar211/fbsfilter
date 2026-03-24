@@ -1,6 +1,6 @@
-"""Groq API integration for AI-assisted filtering in fbsfilter.
+"""Multi-provider AI integration for fbsfilter.
 
-Provides AI-powered credential and proxy analysis using the Groq cloud API.
+Supports Groq (fast inference) and NVIDIA NIM (via OpenAI-compatible API).
 AI filter mode is optional – the tool works in normal mode without an API key.
 """
 
@@ -11,23 +11,58 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger("fbsfilter.ai_filter")
 
+# ---------------------------------------------------------------------------
+# Provider state
+# ---------------------------------------------------------------------------
+
 _groq_client = None
 _groq_available = False
+_nvidia_client = None
+_nvidia_available = False
+_active_provider: str = "groq"   # "groq" or "nvidia"
+_active_model: str = "llama3-70b-8192"
+
+# Available models per provider (name → display label)
+GROQ_MODELS = {
+    "llama3-70b-8192": "Llama 3 70B (recommended)",
+    "llama3-8b-8192": "Llama 3 8B (fast)",
+    "mixtral-8x7b-32768": "Mixtral 8x7B (large context)",
+    "gemma2-9b-it": "Gemma 2 9B",
+}
+NVIDIA_MODELS = {
+    "meta/llama-3.1-70b-instruct": "Llama 3.1 70B (recommended)",
+    "meta/llama-3.1-8b-instruct": "Llama 3.1 8B (fast)",
+    "mistralai/mistral-7b-instruct-v0.3": "Mistral 7B",
+    "microsoft/phi-3-mini-128k-instruct": "Phi-3 Mini 128K",
+}
+
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 
 try:
     from groq import Groq
     _groq_available = True
 except ImportError:
     _groq_available = False
-    logger.debug("groq package not installed – AI features disabled")
+    logger.debug("groq package not installed – Groq AI features disabled")
+
+try:
+    import openai as _openai_module
+    _nvidia_available = True
+except ImportError:
+    _nvidia_available = False
+    logger.debug("openai package not installed – NVIDIA NIM features disabled")
 
 
-def init_groq(api_key: str) -> Tuple[bool, str]:
+# ---------------------------------------------------------------------------
+# Initialisation helpers
+# ---------------------------------------------------------------------------
+
+def init_groq(api_key: str, model: str = "llama3-70b-8192") -> Tuple[bool, str]:
     """Initialise the Groq client with the supplied key.
 
     Returns (success, message).
     """
-    global _groq_client
+    global _groq_client, _active_provider, _active_model
     if not _groq_available:
         return False, "groq package is not installed. Run: pip install groq"
     if not api_key or not api_key.strip():
@@ -35,10 +70,36 @@ def init_groq(api_key: str) -> Tuple[bool, str]:
     try:
         client = Groq(api_key=api_key.strip())
         _groq_client = client
-        return True, "Groq API key accepted."
+        _active_provider = "groq"
+        _active_model = model
+        return True, f"Groq connected ✓  Model: {GROQ_MODELS.get(model, model)}"
     except Exception as exc:
         _groq_client = None
         return False, f"Groq API error: {exc}"
+
+
+def init_nvidia(api_key: str, model: str = "meta/llama-3.1-70b-instruct") -> Tuple[bool, str]:
+    """Initialise the NVIDIA NIM client (OpenAI-compatible API).
+
+    Returns (success, message).
+    """
+    global _nvidia_client, _active_provider, _active_model
+    if not _nvidia_available:
+        return False, "openai package is not installed. Run: pip install openai"
+    if not api_key or not api_key.strip():
+        return False, "API key is empty."
+    try:
+        client = _openai_module.OpenAI(
+            base_url=NVIDIA_BASE_URL,
+            api_key=api_key.strip(),
+        )
+        _nvidia_client = client
+        _active_provider = "nvidia"
+        _active_model = model
+        return True, f"NVIDIA NIM connected ✓  Model: {NVIDIA_MODELS.get(model, model)}"
+    except Exception as exc:
+        _nvidia_client = None
+        return False, f"NVIDIA API error: {exc}"
 
 
 def is_groq_ready() -> bool:
@@ -46,20 +107,60 @@ def is_groq_ready() -> bool:
     return _groq_client is not None
 
 
-def _chat(system: str, user: str, model: str = "llama3-8b-8192", max_tokens: int = 512) -> str:
-    """Send a chat completion request and return the response text."""
-    if _groq_client is None:
-        raise RuntimeError("Groq client not initialised. Provide an API key first.")
-    response = _groq_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.2,
+def is_ai_ready() -> bool:
+    """Return True if *any* AI provider is ready."""
+    return _groq_client is not None or _nvidia_client is not None
+
+
+def get_active_provider() -> str:
+    """Return the name of the currently active AI provider ('groq' or 'nvidia')."""
+    return _active_provider
+
+
+def get_active_model() -> str:
+    """Return the currently active model identifier."""
+    return _active_model
+
+
+# ---------------------------------------------------------------------------
+# Internal chat helper – routes to the active provider
+# ---------------------------------------------------------------------------
+
+def _chat(system: str, user: str, model: Optional[str] = None, max_tokens: int = 512) -> str:
+    """Send a chat completion request to the active AI provider.
+
+    *model* overrides the active model when provided.
+    """
+    effective_model = model or _active_model
+
+    if _active_provider == "nvidia" and _nvidia_client is not None:
+        response = _nvidia_client.chat.completions.create(
+            model=effective_model or "meta/llama-3.1-70b-instruct",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+
+    if _groq_client is not None:
+        response = _groq_client.chat.completions.create(
+            model=effective_model or "llama3-70b-8192",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+
+    raise RuntimeError(
+        "No AI provider initialised. "
+        "Enter a Groq or NVIDIA API key in the AI Assistant tab."
     )
-    return response.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +290,7 @@ def ai_prioritize_credentials(credentials: List[Tuple[str, str]]) -> List[Tuple[
 
     If the AI is not available or fails, the original order is preserved.
     """
-    if not credentials or not is_groq_ready():
+    if not credentials or not is_ai_ready():
         return credentials
 
     sample_lines = []
@@ -239,7 +340,7 @@ def ai_optimize_settings(stats: dict) -> dict:
     Returns a dict with optional keys: threads (int), delay (float), message (str).
     On failure returns an empty dict.
     """
-    if not is_groq_ready():
+    if not is_ai_ready():
         return {}
 
     system = (
@@ -282,8 +383,8 @@ def ai_analyze_failure_patterns(stats: dict) -> str:
     *stats* should contain: processed, working, invalid, locked, errors,
     elapsed_seconds, proxy_count, current_threads, current_delay.
     """
-    if not is_groq_ready():
-        return "AI not connected. Provide a Groq API key in the AI Assistant tab."
+    if not is_ai_ready():
+        return "AI not connected. Provide a Groq or NVIDIA API key in the AI Assistant tab."
 
     locked = stats.get("locked", 0)
     errors = stats.get("errors", 0)
