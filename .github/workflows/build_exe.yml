@@ -14,6 +14,10 @@ on:
   # Allow manual trigger from the GitHub Actions UI
   workflow_dispatch:
 
+# Explicit permissions – read is enough for build; write needed only for releases
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
